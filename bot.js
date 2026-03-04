@@ -409,7 +409,7 @@ async function handleQuotexResponse(chatId, telegramId, username, quotexId, step
     { parse_mode: 'HTML' });
 
   if (step === 'awaiting_quotex_premium') {
-    // Instrucciones de pago detalladas
+    // Instrucciones de pago detalladas con botón que incluye requestId
     await bot.sendMessage(chatId,
       '💰 <b>Instrucciones para el pago premium:</b>\n\n'
       + '1. Realiza una transferencia de <b>3000 CUP</b> a la siguiente tarjeta:\n'
@@ -417,16 +417,14 @@ async function handleQuotexResponse(chatId, telegramId, username, quotexId, step
       + '2. En Transfermóvil, <b>activa la casilla "Mostrar número al destinatario"</b> para que podamos verificar tu pago.\n'
       + '3. Luego, presiona el botón "📞 Enviar número" y escribe el número de teléfono desde el cual realizaste la transferencia.\n\n'
       + '⬇️ Presiona el botón para continuar.',
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📞 Enviar número', callback_data: 'send_phone' }]] } }
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📞 Enviar número', callback_data: `send_phone_${req.id}` }]] } }
     );
-    // Guardamos el request_id en el estado para asociarlo luego
-    await setUserState(chatId, 'awaiting_phone_init', { requestId: req.id });
   } else {
     // Free: notificar al admin
     await notifyAdminNewRequest(req.id, username, telegramId, quotexId, req.type);
   }
 
-  await clearUserState(chatId); // limpiamos el estado anterior
+  await clearUserState(chatId); // limpiamos el estado anterior (el de espera de ID)
 }
 
 async function handlePhoneResponse(chatId, telegramId, phone, data) {
@@ -474,8 +472,12 @@ async function handleSignalAsset(chatId, telegramId, asset, data) {
   if (!asset || asset.length < 2) {
     return bot.sendMessage(chatId, '❌ Activo no válido. Intenta de nuevo.');
   }
+  const assetUpper = asset.toUpperCase();
+  // Notificar a los usuarios aprobados sobre el activo
+  await notifyClients(chatId, `📊 <b>Activo de la próxima señal:</b> ${assetUpper}`, data.sessionId);
+  
   // Guardamos el nuevo estado con el activo en mayúsculas
-  await setUserState(chatId, 'signal_timeframe', { ...data, asset: asset.toUpperCase() });
+  await setUserState(chatId, 'signal_timeframe', { ...data, asset: assetUpper });
   const keyboard = {
     inline_keyboard: [
       [{ text: '⏱️ 30s', callback_data: 'tf_30s' }, { text: '⏱️ 1M', callback_data: 'tf_1M' }],
@@ -560,6 +562,37 @@ async function handleHistorial(chatId, user) {
   await bot.sendMessage(chatId, '📜 <b>Últimas señales:</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
 }
 
+// Notificar a todos los clientes aprobados (solo los que están en la sesión activa)
+async function notifyClients(chatId, message, sessionId) {
+  const { data: users } = await supabase
+    .from('users')
+    .select('telegram_id, membership, id')
+    .eq('approved', true);
+  
+  // Obtener señales de esta sesión para contar entregas
+  const { data: sessionSignals } = await supabase
+    .from('signals')
+    .select('id')
+    .eq('session_id', sessionId);
+  const signalIds = sessionSignals.map(s => s.id);
+
+  for (const user of users || []) {
+    // Contar cuántas señales ha recibido en esta sesión
+    const { count } = await supabase
+      .from('signal_deliveries')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', user.id)
+      .in('signal_id', signalIds);
+    const maxAllowed = user.membership === 'premium' ? 10 : 5;
+    // Solo notificamos si aún puede recibir señales en esta sesión
+    if (count < maxAllowed) {
+      try {
+        await bot.sendMessage(user.telegram_id, message, { parse_mode: 'HTML' });
+      } catch (e) { }
+    }
+  }
+}
+
 async function notifyAdminNewRequest(requestId, username, telegramId, quotexId, type) {
   for (const adminId of adminIds) {
     const keyboard = {
@@ -633,10 +666,9 @@ bot.on('callback_query', async (callbackQuery) => {
       );
       await setUserState(chatId, 'awaiting_quotex_premium', { userId: user.id });
     }
-    else if (data === 'send_phone') {
-      const state = await getUserState(chatId);
-      if (!state || state.step !== 'awaiting_phone_init') return;
-      await setUserState(chatId, 'awaiting_phone', { requestId: state.data.requestId });
+    else if (data.startsWith('send_phone_')) {
+      const requestId = parseInt(data.split('_')[2]);
+      await setUserState(chatId, 'awaiting_phone', { requestId });
       await bot.editMessageText(
         '📞 <b>Envía el número de teléfono</b> desde el cual realizaste la transferencia (solo dígitos):',
         { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
@@ -762,6 +794,10 @@ bot.on('callback_query', async (callbackQuery) => {
       const tf = data.split('_')[1];
       const state = await getUserState(chatId);
       if (!state || !state.data || !state.data.asset) return;
+      const { asset, sessionId } = state.data;
+      // Notificar a clientes sobre la temporalidad
+      await notifyClients(chatId, `⏱️ <b>Tiempo de la señal:</b> ${tf} (${asset})`, sessionId);
+      
       await setUserState(chatId, 'signal_direction', { ...state.data, timeframe: tf });
       const keyboard = {
         inline_keyboard: [
@@ -778,86 +814,100 @@ bot.on('callback_query', async (callbackQuery) => {
 
       const { asset, timeframe, sessionId } = state.data;
       
-      // Obtener el último ID de señal global
-      const { data: lastSignal } = await supabase
-        .from('signals')
-        .select('id')
-        .order('id', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      const nextId = lastSignal ? lastSignal.id + 1 : 1;
-
-      const { data: signal, error } = await supabase
-        .from('signals')
-        .insert([{ 
-          id: nextId,
-          session_id: sessionId, 
-          signal_index: nextId, 
-          asset, 
-          timeframe, 
-          direction 
-        }])
-        .select()
-        .single();
-      if (error) throw error;
-
-      // Obtener usuarios aprobados
-      const { data: users } = await supabase.from('users').select('id, telegram_id, membership').eq('approved', true);
+      // Notificar a clientes la dirección
+      const emojiDir = direction === 'up' ? '⬆️' : '⬇️';
+      await notifyClients(chatId, `📊 <b>Dirección:</b> ${emojiDir}`, sessionId);
       
-      // Obtener señales de esta sesión para contar entregas
-      const { data: sessionSignals } = await supabase
-        .from('signals')
-        .select('id')
-        .eq('session_id', sessionId);
-      const signalIds = sessionSignals.map(s => s.id);
+      // Pequeña pausa antes de enviar el ticket
+      setTimeout(async () => {
+        // Obtener el último ID de señal global
+        const { data: lastSignal } = await supabase
+          .from('signals')
+          .select('id')
+          .order('id', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        const nextId = lastSignal ? lastSignal.id + 1 : 1;
 
-      for (const user of users || []) {
-        const { count } = await supabase
-          .from('signal_deliveries')
-          .select('*', { count: 'exact', head: true })
-          .eq('user_id', user.id)
-          .in('signal_id', signalIds);
-        const maxAllowed = user.membership === 'premium' ? 10 : 5;
-        if (count >= maxAllowed) continue;
+        const { data: signal, error } = await supabase
+          .from('signals')
+          .insert([{ 
+            id: nextId,
+            session_id: sessionId, 
+            signal_index: nextId, 
+            asset, 
+            timeframe, 
+            direction 
+          }])
+          .select()
+          .single();
+        if (error) throw error;
 
-        const emoji = direction === 'up' ? '⬆️' : '⬇️';
-        const text = `📈 <b>Señal #${signal.id}</b>\n`
-                   + `💰 Activo: ${asset}\n`
-                   + `⏱️ Tiempo: ${timeframe}\n`
-                   + `📊 Dirección: ${emoji}\n`
-                   + `📌 Resultado: ⏳ Pendiente`;
-        try {
-          await bot.sendMessage(user.telegram_id, text, { parse_mode: 'HTML' });
-          await supabase.from('signal_deliveries').insert([{ signal_id: signal.id, user_id: user.id }]);
-        } catch (e) { }
-      }
+        // Obtener usuarios aprobados
+        const { data: users } = await supabase.from('users').select('id, telegram_id, membership').eq('approved', true);
+        
+        // Obtener señales de esta sesión para contar entregas
+        const { data: sessionSignals } = await supabase
+          .from('signals')
+          .select('id')
+          .eq('session_id', sessionId);
+        const signalIds = sessionSignals.map(s => s.id);
 
+        for (const user of users || []) {
+          const { count } = await supabase
+            .from('signal_deliveries')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', user.id)
+            .in('signal_id', signalIds);
+          const maxAllowed = user.membership === 'premium' ? 10 : 5;
+          if (count >= maxAllowed) continue;
+
+          const emoji = direction === 'up' ? '⬆️' : '⬇️';
+          const text = `📈 <b>Señal #${signal.id}</b>\n`
+                     + `💰 Activo: ${asset}\n`
+                     + `⏱️ Tiempo: ${timeframe}\n`
+                     + `📊 Dirección: ${emoji}\n`
+                     + `📌 Resultado: ⏳ Pendiente`;
+          try {
+            await bot.sendMessage(user.telegram_id, text, { parse_mode: 'HTML' });
+            await supabase.from('signal_deliveries').insert([{ signal_id: signal.id, user_id: user.id }]);
+          } catch (e) { }
+        }
+      }, 3000); // 3 segundos de espera
+
+      // Guardamos estado para manejar opciones de mantener/nuevo activo
+      await setUserState(chatId, 'awaiting_choice', { sessionId, asset });
       const keyboard = {
         inline_keyboard: [
           [{ text: '🔄 Mantener activo', callback_data: 'keep_asset' }],
           [{ text: '🆕 Nuevo activo', callback_data: 'new_asset' }],
         ],
       };
-      await bot.editMessageText(`✅ <b>Señal #${signal.id} enviada.</b>\n¿Deseas mantener el activo ${asset}?`, {
+      await bot.editMessageText(`✅ <b>Señal enviada.</b>\n¿Deseas mantener el activo ${asset}?`, {
         chat_id: chatId,
         message_id: messageId,
         reply_markup: keyboard,
         parse_mode: 'HTML'
       });
-      await clearUserState(chatId);
     }
     else if (data === 'keep_asset' && isAdmin(telegramId)) {
       const state = await getUserState(chatId);
-      if (!state || !state.data || !state.data.asset) return;
-      // Para mantener el activo, pasamos a seleccionar tiempo nuevamente
-      await setUserState(chatId, 'signal_timeframe', { ...state.data, asset: state.data.asset });
+      if (!state || state.step !== 'awaiting_choice' || !state.data.asset || !state.data.sessionId) {
+        return bot.editMessageText('⚠️ No hay una sesión activa para mantener. Inicia una nueva señal.', { chat_id: chatId, message_id: messageId });
+      }
+      const { asset, sessionId } = state.data;
+      // Notificar a clientes que se mantiene el activo
+      await notifyClients(chatId, `🔄 <b>Mantenemos el activo:</b> ${asset}`, sessionId);
+      
+      // Pasamos a pedir temporalidad de nuevo
+      await setUserState(chatId, 'signal_timeframe', { sessionId, asset });
       const keyboard = {
         inline_keyboard: [
           [{ text: '⏱️ 30s', callback_data: 'tf_30s' }, { text: '⏱️ 1M', callback_data: 'tf_1M' }],
           [{ text: '⏱️ 2M', callback_data: 'tf_2M' }, { text: '⏱️ 5M', callback_data: 'tf_5M' }],
         ],
       };
-      await bot.editMessageText(`🔄 <b>Manteniendo activo:</b> ${state.data.asset}\nSelecciona temporalidad:`, {
+      await bot.editMessageText(`🔄 <b>Manteniendo activo:</b> ${asset}\nSelecciona temporalidad:`, {
         chat_id: chatId,
         message_id: messageId,
         reply_markup: keyboard,
@@ -866,8 +916,14 @@ bot.on('callback_query', async (callbackQuery) => {
     }
     else if (data === 'new_asset' && isAdmin(telegramId)) {
       const state = await getUserState(chatId);
-      if (!state || !state.data || !state.data.sessionId) return;
-      await setUserState(chatId, 'signal_asset', { sessionId: state.data.sessionId });
+      if (!state || state.step !== 'awaiting_choice' || !state.data.sessionId) {
+        return bot.editMessageText('⚠️ No hay una sesión activa. Inicia una nueva señal.', { chat_id: chatId, message_id: messageId });
+      }
+      const { sessionId } = state.data;
+      // Notificar a clientes que cambiaremos de activo
+      await notifyClients(chatId, `🆕 <b>Cambiando de activo...</b>`, sessionId);
+      
+      await setUserState(chatId, 'signal_asset', { sessionId });
       await bot.editMessageText('✏️ <b>Envía el nuevo activo (ej. EURUSD):</b>', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
     }
     else if (data.startsWith('result_') && isAdmin(telegramId)) {
