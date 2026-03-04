@@ -114,7 +114,7 @@ const mainMenuKeyboard = {
     keyboard: [
       [{ text: '📊 Planes' }, { text: '📈 Estadísticas' }],
       [{ text: '📜 Historial' }, { text: '❓ Ayuda' }],
-      [{ text: '🔍 Buscar señal' }, { text: '🤖 Kheel IA' }]
+      [{ text: '🔍 Buscar señal' }]  // Kheel IA se añade dinámicamente si es premium
     ],
     resize_keyboard: true,
     one_time_keyboard: false
@@ -126,12 +126,30 @@ const adminMenuKeyboard = {
     keyboard: [
       [{ text: '📊 Planes' }, { text: '📈 Estadísticas' }],
       [{ text: '📜 Historial' }, { text: '❓ Ayuda' }],
-      [{ text: '🔧 Panel Admin' }, { text: '🔍 Buscar señal' }],
-      [{ text: '🤖 Kheel IA' }]
+      [{ text: '🔧 Panel Admin' }, { text: '🔍 Buscar señal' }]
     ],
     resize_keyboard: true
   }
 };
+
+// Función para actualizar el menú según membresía
+async function updateMenu(chatId, telegramId) {
+  const user = await getUser(telegramId);
+  if (!user) return;
+  let keyboard;
+  if (isAdmin(telegramId)) {
+    keyboard = { ...adminMenuKeyboard };
+    if (user.membership === 'premium') {
+      keyboard.reply_markup.keyboard.push([{ text: '🤖 Kheel IA' }]);
+    }
+  } else {
+    keyboard = { ...mainMenuKeyboard };
+    if (user.membership === 'premium') {
+      keyboard.reply_markup.keyboard.push([{ text: '🤖 Kheel IA' }]);
+    }
+  }
+  await bot.sendMessage(chatId, 'Menú actualizado:', keyboard);
+}
 
 // ================== ESTADOS PERSISTENTES EN SUPABASE ==================
 async function setUserState(chatId, step, data = {}) {
@@ -209,6 +227,7 @@ function chooseModel(userMessage, hasImage = false) {
 }
 
 async function askKheel(userId, userMessage, imageUrl = null) {
+  logger.info(`Kheel: Recibiendo mensaje de usuario ${userId}: "${userMessage.substring(0, 100)}..."`);
   const { data: history, error } = await supabase
     .from('user_conversations')
     .select('role, content')
@@ -275,6 +294,7 @@ Si el usuario envía una imagen (gráfico, noticia), analízala y comenta lo que
     });
 
     const reply = completion.choices[0].message.content;
+    logger.info(`Kheel respondió correctamente a usuario ${userId}`);
 
     await supabase.from('user_conversations').insert([
       { user_id: userId, role: 'user', content: userMessage },
@@ -283,7 +303,10 @@ Si el usuario envía una imagen (gráfico, noticia), analízala y comenta lo que
 
     return reply;
   } catch (err) {
-    logger.error(`Error en Kheel: ${err.message}`);
+    logger.error(`Error en Kheel para usuario ${userId}: ${err.message}`);
+    if (err.response) {
+      logger.error(`Detalles: ${JSON.stringify(err.response.data)}`);
+    }
     throw err;
   }
 }
@@ -324,7 +347,7 @@ bot.onText(/\/start/, async (msg) => {
 
   try {
     const user = await getOrCreateUser(telegramId, username);
-    const keyboard = isAdmin(telegramId) ? adminMenuKeyboard : mainMenuKeyboard;
+    await updateMenu(chatId, telegramId);
     const welcomeText = 
       '🚀 *¡Bienvenido al Bot de Señales de Trading!*\n\n'
       + '📊 *¿Qué ofrecemos?*\n'
@@ -339,12 +362,19 @@ bot.onText(/\/start/, async (msg) => {
     await bot.sendMessage(
       chatId,
       welcomeText,
-      { ...keyboard, parse_mode: 'Markdown' }
+      { parse_mode: 'Markdown' }
     );
   } catch (error) {
     logger.error(`Error en /start: ${error.message}`);
     await bot.sendMessage(chatId, '❌ Ocurrió un error. Intenta más tarde.');
   }
+});
+
+// ================== COMANDO /CANCELAR ==================
+bot.onText(/\/cancelar/, async (msg) => {
+  const chatId = msg.chat.id;
+  await clearUserState(chatId);
+  await bot.sendMessage(chatId, '✅ Acción cancelada. Puedes seguir usando el bot.');
 });
 
 // ================== MANEJADOR DE MENSAJES DE TEXTO ==================
@@ -383,6 +413,10 @@ bot.on('message', async (msg) => {
     if (!user) return bot.sendMessage(chatId, '❌ Usa /start primero.');
 
     if (text === '📊 Planes') {
+      // Verificar si ya es premium vigente
+      if (user.membership === 'premium' && user.premium_until && new Date(user.premium_until) > new Date()) {
+        return bot.sendMessage(chatId, '⚠️ Ya eres usuario premium. No puedes solicitar otro plan hasta que expire tu membresía actual.', { parse_mode: 'Markdown' });
+      }
       const keyboard = {
         inline_keyboard: [
           [{ text: '🆓 Plan Básico (gratis)', callback_data: 'plan_free' }],
@@ -419,7 +453,7 @@ bot.on('message', async (msg) => {
         + '🔍 Buscar señal: Premium - consulta detalles de una señal por ID.\n'
         + '🤖 Kheel IA: Premium - asistente inteligente para aprender.\n'
         + '🔧 Panel Admin: Solo para administradores.\n\n'
-        + 'Para más información, contacta al admin.',
+        + 'Para cancelar una acción en curso, usa /cancelar.',
         { parse_mode: 'Markdown' }
       );
     }
@@ -436,9 +470,14 @@ bot.on('message', async (msg) => {
       };
       await bot.sendMessage(chatId, '🔧 *Panel de Administración:*', { reply_markup: keyboard, parse_mode: 'Markdown' });
     }
-    else if (user.membership === 'premium' && !isAdmin(telegramId)) {
-      const reply = await askKheel(user.id, text);
-      await bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
+    else if (user.membership === 'premium') {
+      // Cualquier otro texto lo responde Kheel (incluyendo admins premium)
+      try {
+        const reply = await askKheel(user.id, text);
+        await bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
+      } catch (err) {
+        await bot.sendMessage(chatId, '❌ Lo siento, ahora no puedo procesar tu consulta. Intenta más tarde.');
+      }
     }
   } catch (error) {
     logger.error(`Error en message handler: ${error.message}`);
@@ -708,11 +747,23 @@ bot.on('callback_query', async (callbackQuery) => {
     const user = await getOrCreateUser(telegramId, username);
     logger.info(`Callback: data=${data}, chatId=${chatId}, telegramId=${telegramId}`);
 
+    // ===== CANCELAR =====
+    if (data === 'cancel_request') {
+      await clearUserState(chatId);
+      await bot.editMessageText('✅ Solicitud cancelada.', { chat_id: chatId, message_id: messageId });
+      return;
+    }
+
     // ===== PLANES =====
     if (data === 'plan_free') {
+      if (user.membership === 'premium' && user.premium_until && new Date(user.premium_until) > new Date()) {
+        return bot.editMessageText('⚠️ Ya eres usuario premium. No puedes solicitar otro plan.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
+      }
       if (await hasActiveRequest(user.id)) {
         return bot.editMessageText('⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
       }
+      const cancelButton = [{ text: '❌ Cancelar', callback_data: 'cancel_request' }];
+      const keyboard = { inline_keyboard: [cancelButton] };
       await bot.editMessageText(
         '🆓 *Plan Básico (Gratis)*\n\n'
         + '📌 *Requisitos:*\n'
@@ -721,14 +772,19 @@ bot.on('callback_query', async (callbackQuery) => {
         + '3. Completa la verificación KYC.\n'
         + '4. Realiza un depósito mínimo de *10 USDT* en tu cuenta Quotex.\n\n'
         + '📤 *Luego de registrarte, responde a este mensaje con tu ID de Quotex.*',
-        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' }
+        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: keyboard }
       );
       await setUserState(chatId, 'awaiting_quotex_free', { userId: user.id });
     }
     else if (data === 'plan_premium') {
+      if (user.membership === 'premium' && user.premium_until && new Date(user.premium_until) > new Date()) {
+        return bot.editMessageText('⚠️ Ya eres usuario premium. No puedes solicitar otro plan.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
+      }
       if (await hasActiveRequest(user.id)) {
         return bot.editMessageText('⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
       }
+      const cancelButton = [{ text: '❌ Cancelar', callback_data: 'cancel_request' }];
+      const keyboard = { inline_keyboard: [cancelButton] };
       await bot.editMessageText(
         '⭐ *Plan Premium (3000 CUP/mes)*\n\n'
         + '📌 *Requisitos:*\n'
@@ -738,16 +794,18 @@ bot.on('callback_query', async (callbackQuery) => {
         + '💰 *Pago de membresía:* 3000 CUP\n'
         + '4. Después de enviar tu ID de Quotex, recibirás las instrucciones para realizar el pago.\n\n'
         + '📤 *Responde a este mensaje con tu ID de Quotex para comenzar.*',
-        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' }
+        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: keyboard }
       );
       await setUserState(chatId, 'awaiting_quotex_premium', { userId: user.id });
     }
     else if (data.startsWith('send_phone_')) {
       const requestId = parseInt(data.split('_')[2]);
       await setUserState(chatId, 'awaiting_phone', { requestId });
+      const cancelButton = [{ text: '❌ Cancelar', callback_data: 'cancel_request' }];
+      const keyboard = { inline_keyboard: [cancelButton] };
       await bot.editMessageText(
         '📞 *Envía el número de teléfono* desde el cual realizaste la transferencia (solo dígitos):',
-        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' }
+        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: keyboard }
       );
     }
 
@@ -780,7 +838,12 @@ bot.on('callback_query', async (callbackQuery) => {
     else if (data.startsWith('reject_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[1]);
       await setUserState(chatId, 'reject_reason', { reqId });
-      await bot.editMessageText('✏️ *Envía el motivo del rechazo:*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
+      const cancelButton = [{ text: '❌ Cancelar', callback_data: 'cancel_request' }];
+      const keyboard = { inline_keyboard: [cancelButton] };
+      await bot.editMessageText(
+        '✏️ *Envía el motivo del rechazo:*',
+        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: keyboard }
+      );
     }
 
     // ===== ADMIN: PAGOS =====
@@ -813,7 +876,9 @@ bot.on('callback_query', async (callbackQuery) => {
       const reqId = parseInt(data.split('_')[2]);
       await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId });
       await setUserState(chatId, 'reject_reason', { reqId });
-      await bot.sendMessage(chatId, '✏️ *Envía el motivo del rechazo del pago:*', { parse_mode: 'Markdown' });
+      const cancelButton = [{ text: '❌ Cancelar', callback_data: 'cancel_request' }];
+      const keyboard = { inline_keyboard: [cancelButton] };
+      await bot.sendMessage(chatId, '✏️ *Envía el motivo del rechazo del pago:*', { parse_mode: 'Markdown', reply_markup: keyboard });
     }
 
     // ===== ADMIN: GESTIÓN DE SESIONES Y SEÑALES =====
@@ -869,7 +934,9 @@ bot.on('callback_query', async (callbackQuery) => {
         return bot.editMessageText('⚠️ No hay una sesión abierta. Abre una primero.', { chat_id: chatId, message_id: messageId });
       }
       await setUserState(chatId, 'signal_asset', { sessionId: session.id });
-      await bot.editMessageText('✏️ *Envía el activo (ej. EURUSD):*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
+      const cancelButton = [{ text: '❌ Cancelar', callback_data: 'cancel_request' }];
+      const keyboard = { inline_keyboard: [cancelButton] };
+      await bot.editMessageText('✏️ *Envía el activo (ej. EURUSD):*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: keyboard });
     }
     else if (data.startsWith('tf_') && isAdmin(telegramId)) {
       const tf = data.split('_')[1];
@@ -883,6 +950,7 @@ bot.on('callback_query', async (callbackQuery) => {
         inline_keyboard: [
           [{ text: '⬆️ Arriba', callback_data: 'dir_up' }],
           [{ text: '⬇️ Abajo', callback_data: 'dir_down' }],
+          [{ text: '❌ Cancelar', callback_data: 'cancel_request' }]
         ],
       };
       await bot.editMessageText('📊 *Selecciona dirección:*', { chat_id: chatId, message_id: messageId, reply_markup: keyboard, parse_mode: 'Markdown' });
@@ -955,6 +1023,7 @@ bot.on('callback_query', async (callbackQuery) => {
         inline_keyboard: [
           [{ text: '🔄 Mantener activo', callback_data: 'keep_asset' }],
           [{ text: '🆕 Nuevo activo', callback_data: 'new_asset' }],
+          [{ text: '❌ Cancelar', callback_data: 'cancel_request' }]
         ],
       };
       await bot.editMessageText(`✅ *Señal enviada.*\n¿Deseas mantener el activo ${asset}?`, {
@@ -977,6 +1046,7 @@ bot.on('callback_query', async (callbackQuery) => {
         inline_keyboard: [
           [{ text: '⏱️ 30s', callback_data: 'tf_30s' }, { text: '⏱️ 1M', callback_data: 'tf_1M' }],
           [{ text: '⏱️ 2M', callback_data: 'tf_2M' }, { text: '⏱️ 5M', callback_data: 'tf_5M' }],
+          [{ text: '❌ Cancelar', callback_data: 'cancel_request' }]
         ],
       };
       await bot.editMessageText(`🔄 *Manteniendo activo:* ${asset}\nSelecciona temporalidad:`, {
@@ -995,7 +1065,9 @@ bot.on('callback_query', async (callbackQuery) => {
       await notifyClients(chatId, `🆕 *Cambiando de activo...*`, sessionId);
       
       await setUserState(chatId, 'signal_asset', { sessionId });
-      await bot.editMessageText('✏️ *Envía el nuevo activo (ej. EURUSD):*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
+      const cancelButton = [{ text: '❌ Cancelar', callback_data: 'cancel_request' }];
+      const keyboard = { inline_keyboard: [cancelButton] };
+      await bot.editMessageText('✏️ *Envía el nuevo activo (ej. EURUSD):*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: keyboard });
     }
     else if (data.startsWith('result_') && isAdmin(telegramId)) {
       const parts = data.split('_');
@@ -1116,7 +1188,7 @@ bot.on('photo', async (msg) => {
 
     // Si no es para pago, y el usuario es premium, enviar la imagen a Kheel
     const user = await getUser(telegramId);
-    if (!user || user.membership !== 'premium' || isAdmin(telegramId)) return;
+    if (!user || user.membership !== 'premium') return;
 
     const fileLink = await bot.getFileLink(photo.file_id);
     const reply = await askKheel(user.id, 'Analiza esta imagen:', fileLink);
