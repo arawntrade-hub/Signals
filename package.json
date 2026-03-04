@@ -1,0 +1,19 @@
+{
+  "name": "trading-signals-bot",
+  "version": "1.0.0",
+  "description": "Bot de Telegram para señales de trading con membresías e IA",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.38.4",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "form-data": "^4.0.0",
+    "node-cron": "^3.0.3",
+    "node-telegram-bot-api": "^0.64.0",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0"
+  }
+}
