@@ -234,9 +234,9 @@ Utiliza el historial de la conversación para mantener contexto y responder de m
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: 'mistralai/mistral-7b-instruct', // gratuito
+        model: 'stepfun/step-3.5-flash:free', // gratuito
         messages,
-        max_tokens: 700,
+        max_tokens: 1500,
         temperature: 0.7,
       },
       {
