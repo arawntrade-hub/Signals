@@ -1,7 +1,7 @@
 {
   "name": "trading-signals-bot",
-  "version": "2.0.0",
-  "description": "Bot de Telegram para señales de trading con panel web y IA",
+  "version": "3.1.0",
+  "description": "Bot de Telegram para señales de trading con panel web, IA Kheel y múltiples modelos",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
@@ -16,6 +16,7 @@
     "form-data": "^4.0.0",
     "node-cron": "^3.0.3",
     "node-telegram-bot-api": "^0.64.0",
+    "openai": "^4.20.1",
     "uuid": "^9.0.1",
     "winston": "^3.11.0"
   },
