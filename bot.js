@@ -233,10 +233,20 @@ bot.onText(/\/start/, async (msg) => {
   try {
     const user = await getOrCreateUser(telegramId, username);
     const keyboard = isAdmin(telegramId) ? adminMenuKeyboard : mainMenuKeyboard;
+    const welcomeText = 
+      '🚀 <b>¡Bienvenido al Bot de Señales de Trading!</b>\n\n'
+      + '📊 <b>¿Qué ofrecemos?</b>\n'
+      + '• Señales de trading en vivo para opciones binarias.\n'
+      + '• Dos sesiones diarias (10:00 AM y 10:00 PM hora Cuba).\n'
+      + '• Estadísticas y historial de señales.\n'
+      + '• Asistente IA para consultas (solo premium).\n\n'
+      + '🎯 <b>Planes:</b>\n'
+      + '🆓 <b>Básico (gratis):</b> 5 señales por sesión, estadísticas desde tu registro.\n'
+      + '⭐ <b>Premium (3000 CUP/mes):</b> 10 señales por sesión, estadísticas completas, acceso a IA.\n\n'
+      + 'Para contratar, usa el botón 📊 Planes del menú.';
     await bot.sendMessage(
       chatId,
-      '🚀 <b>¡Bienvenido al Bot de Señales de Trading!</b>\n\n'
-      + 'Selecciona una opción del menú:',
+      welcomeText,
       { ...keyboard, parse_mode: 'HTML' }
     );
   } catch (error) {
@@ -259,6 +269,9 @@ bot.on('message', async (msg) => {
     if (state) {
       if (state.step === 'awaiting_quotex_free' || state.step === 'awaiting_quotex_premium') {
         await handleQuotexResponse(chatId, telegramId, username, text, state.step);
+        return;
+      } else if (state.step === 'reject_reason') {
+        await handleRejectReason(chatId, telegramId, text, state.data);
         return;
       }
       await clearUserState(chatId);
@@ -313,7 +326,7 @@ bot.on('message', async (msg) => {
   }
 });
 
-// Función para manejar la respuesta del ID de Quotex
+// ================== FUNCIONES AUXILIARES ==================
 async function handleQuotexResponse(chatId, telegramId, username, quotexId, step) {
   if (!isValidQuotexId(quotexId)) {
     return bot.sendMessage(chatId, '❌ <b>ID de Quotex no válido.</b>\nDebe tener entre 6 y 20 caracteres alfanuméricos.', { parse_mode: 'HTML' });
@@ -324,28 +337,48 @@ async function handleQuotexResponse(chatId, telegramId, username, quotexId, step
 
   await supabase.from('users').update({ quotex_id: quotexId }).eq('id', user.id);
 
+  // Determinar estado de la solicitud según el tipo
+  const status = (step === 'awaiting_quotex_free') ? 'pending' : 'pending_payment';
+
   const { data: req, error } = await supabase
     .from('membership_requests')
     .insert([{
       user_id: user.id,
       type: step === 'awaiting_quotex_free' ? 'free' : 'premium',
-      status: 'pending'
+      status: status
     }])
     .select()
     .single();
 
   if (error) throw error;
 
-  await bot.sendMessage(chatId, '✅ <b>ID recibido.</b>\nTu solicitud ha sido enviada al admin. Espera la confirmación.', { parse_mode: 'HTML' });
+  // Mensaje de confirmación
+  await bot.sendMessage(chatId, '✅ <b>ID recibido.</b>\n' + 
+    (step === 'awaiting_quotex_free' 
+      ? 'Tu solicitud ha sido enviada al admin. Espera la confirmación.' 
+      : 'Ahora sigue los pasos para completar el pago.'), 
+    { parse_mode: 'HTML' });
+
+  // Si es premium, enviar instrucciones de pago inmediatamente
+  if (step === 'awaiting_quotex_premium') {
+    await bot.sendMessage(chatId,
+      '💰 <b>Instrucciones para el pago premium:</b>\n\n'
+      + '1. Realiza un depósito de <b>3000 CUP</b> a la tarjeta **** **** **** 1234.\n'
+      + '2. Envía tu número de teléfono con el comando:\n<code>/enviar_telefono &lt;número&gt;</code>\n'
+      + '3. Luego envía la captura de la transferencia como foto.\n\n'
+      + 'Una vez recibamos la captura, el admin la verificará y activará tu membresía.',
+      { parse_mode: 'HTML' }
+    );
+  }
+
   await clearUserState(chatId);
 
-  // Notificar a los admins
+  // Notificar a los admins con un botón al panel
   for (const adminId of adminIds) {
     const keyboard = {
       inline_keyboard: [
         [
-          { text: '✅ Aprobar', callback_data: `approve_${req.id}` },
-          { text: '❌ Rechazar', callback_data: `reject_${req.id}` }
+          { text: '🌐 Ir al Panel Web', url: `${BASE_URL}/admin?telegram_id=${adminId}` }
         ]
       ]
     };
@@ -355,14 +388,39 @@ async function handleQuotexResponse(chatId, telegramId, username, quotexId, step
       + `👤 Usuario: ${username ? '@' + username : telegramId}\n`
       + `🆔 ID Telegram: <code>${telegramId}</code>\n`
       + `📋 Tipo: ${req.type === 'free' ? '🆓 Básico' : '⭐ Premium'}\n`
-      + `🔑 ID Quotex: <code>${quotexId}</code>\n\n`
-      + `🌐 Panel web: ${BASE_URL}/admin?telegram_id=${adminId}`,
+      + `🔑 ID Quotex: <code>${quotexId}</code>\n`
+      + `📌 Estado: ${req.status === 'pending' ? 'Pendiente de aprobación' : 'Esperando pago'}`,
       { reply_markup: keyboard, parse_mode: 'HTML' }
     );
   }
 }
 
-// Funciones auxiliares para estadísticas e historial
+async function handleRejectReason(chatId, telegramId, reason, data) {
+  const reqId = data.reqId;
+  await clearUserState(chatId);
+
+  try {
+    const { data: req } = await supabase
+      .from('membership_requests')
+      .select('user:users(telegram_id)')
+      .eq('id', reqId)
+      .single();
+
+    await supabase
+      .from('membership_requests')
+      .update({ status: 'rejected', rejection_reason: reason })
+      .eq('id', reqId);
+
+    if (req) {
+      await bot.sendMessage(req.user.telegram_id, `❌ <b>Tu solicitud ha sido rechazada.</b>\nMotivo: ${reason}`, { parse_mode: 'HTML' });
+    }
+    await bot.sendMessage(chatId, `✅ Rechazo notificado para solicitud #${reqId}.`);
+  } catch (err) {
+    logger.error(`Error en rechazo: ${err.message}`);
+    await bot.sendMessage(chatId, '❌ Error al procesar rechazo.');
+  }
+}
+
 async function handleEstadisticas(chatId, user) {
   let query = supabase.from('signals').select('*');
   if (user.membership === 'free') {
@@ -450,14 +508,14 @@ bot.on('callback_query', async (callbackQuery) => {
         + '2. Cuenta <b>nueva</b> y verificación KYC.\n'
         + '3. Depósito mínimo de <b>10 USDT</b> en Quotex.\n\n'
         + '💰 <b>Pago de membresía:</b> 3000 CUP\n'
-        + '4. Después de aprobar tu registro, te indicaremos los datos de pago.\n\n'
+        + '4. Después de enviar tu ID de Quotex, recibirás las instrucciones para realizar el pago.\n\n'
         + '📤 <i>Responde a este mensaje con tu ID de Quotex para comenzar.</i>',
         { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
       );
       await setUserState(chatId, 'awaiting_quotex_premium', { userId: user.id });
     }
 
-    // ===== ADMIN: APROBAR/RECHAZAR =====
+    // ===== ADMIN: APROBAR/RECHAZAR (solo para free) =====
     else if (data.startsWith('approve_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[1]);
       const { data: req, error } = await supabase
@@ -480,23 +538,8 @@ bot.on('callback_query', async (callbackQuery) => {
         await bot.editMessageText(`✅ Solicitud #${reqId} aprobada (gratis).`, { chat_id: chatId, message_id: messageId });
         await bot.sendMessage(req.user.telegram_id, '✅ <b>¡Felicidades!</b> Tu solicitud básica ha sido aprobada. Ya puedes recibir señales.', { parse_mode: 'HTML' });
       } else {
-        await supabase
-          .from('membership_requests')
-          .update({ status: 'pending_payment' })
-          .eq('id', reqId);
-        await bot.editMessageText(
-          `✅ Solicitud premium #${reqId} aprobada (Quotex verificado).\nEl usuario debe continuar con el pago.`,
-          { chat_id: chatId, message_id: messageId }
-        );
-        await bot.sendMessage(
-          req.user.telegram_id,
-          '✅ <b>Registro en Quotex aprobado.</b>\n\n'
-          + 'Para completar el plan premium:\n'
-          + '1. Realiza un depósito de <b>3000 CUP</b> a la tarjeta **** **** **** 1234.\n'
-          + '2. Envía tu número de teléfono con:\n<code>/enviar_telefono &lt;número&gt;</code>\n'
-          + '3. Luego envía la captura de la transferencia como foto.',
-          { parse_mode: 'HTML' }
-        );
+        // Para premium no se usa este callback
+        await bot.editMessageText('⚠️ Para aprobar un premium, usa el botón de pago.', { chat_id: chatId, message_id: messageId });
       }
     }
     else if (data.startsWith('reject_') && isAdmin(telegramId)) {
@@ -527,19 +570,8 @@ bot.on('callback_query', async (callbackQuery) => {
     }
     else if (data.startsWith('pay_reject_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[2]);
-      await supabase
-        .from('membership_requests')
-        .update({ status: 'rejected' })
-        .eq('id', reqId);
-      await bot.editMessageText('❌ Pago rechazado.', { chat_id: chatId, message_id: messageId });
-      const { data: req } = await supabase
-        .from('membership_requests')
-        .select('user:users(telegram_id)')
-        .eq('id', reqId)
-        .single();
-      if (req) {
-        await bot.sendMessage(req.user.telegram_id, '❌ Tu pago no pudo ser verificado. Contacta al admin.');
-      }
+      await setUserState(chatId, 'reject_reason', { reqId });
+      await bot.editMessageText('✏️ <b>Envía el motivo del rechazo del pago:</b>', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
     }
 
     // ===== ADMIN: GESTIÓN DE SESIONES Y SEÑALES =====
@@ -811,7 +843,7 @@ bot.on('photo', async (msg) => {
         inline_keyboard: [
           [
             { text: '✅ Aceptar pago', callback_data: `pay_accept_${req.id}` },
-            { text: '❌ Rechazar pago', callback_data: `pay_reject_${req.id}` },
+            { text: '❌ Rechazar pago', callback_data: `pay_reject_${req.id}` }
           ],
         ],
       };
