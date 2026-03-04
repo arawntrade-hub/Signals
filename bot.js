@@ -95,12 +95,13 @@ function isValidQuotexId(id) {
   return /^[a-zA-Z0-9]{6,20}$/.test(id);
 }
 
-// ================== MENÚ PRINCIPAL (BOTONES NATIVOS) ==================
+// ================== MENÚ PRINCIPAL ==================
 const mainMenuKeyboard = {
   reply_markup: {
     keyboard: [
       [{ text: '📊 Planes' }, { text: '📈 Estadísticas' }],
-      [{ text: '📜 Historial' }, { text: '❓ Ayuda' }]
+      [{ text: '📜 Historial' }, { text: '❓ Ayuda' }],
+      [{ text: '🔍 Buscar señal' }]
     ],
     resize_keyboard: true,
     one_time_keyboard: false
@@ -112,7 +113,7 @@ const adminMenuKeyboard = {
     keyboard: [
       [{ text: '📊 Planes' }, { text: '📈 Estadísticas' }],
       [{ text: '📜 Historial' }, { text: '❓ Ayuda' }],
-      [{ text: '🔧 Panel Admin' }]
+      [{ text: '🔧 Panel Admin' }, { text: '🔍 Buscar señal' }]
     ],
     resize_keyboard: true
   }
@@ -120,28 +121,41 @@ const adminMenuKeyboard = {
 
 // ================== ESTADOS PERSISTENTES EN SUPABASE ==================
 async function setUserState(chatId, step, data = {}) {
+  logger.info(`setUserState: chatId=${chatId}, step=${step}, data=${JSON.stringify(data)}`);
   const { error } = await supabase
     .from('admin_states')
     .upsert({ chat_id: chatId, step, data }, { onConflict: 'chat_id' });
-  if (error) throw error;
+  if (error) {
+    logger.error(`Error en setUserState: ${error.message}`);
+    throw error;
+  }
 }
 
 async function getUserState(chatId) {
+  logger.info(`getUserState: chatId=${chatId}`);
   const { data, error } = await supabase
     .from('admin_states')
     .select('step, data')
     .eq('chat_id', chatId)
     .maybeSingle();
-  if (error) throw error;
+  if (error) {
+    logger.error(`Error en getUserState: ${error.message}`);
+    throw error;
+  }
+  logger.info(`getUserState result: ${JSON.stringify(data)}`);
   return data;
 }
 
 async function clearUserState(chatId) {
+  logger.info(`clearUserState: chatId=${chatId}`);
   const { error } = await supabase
     .from('admin_states')
     .delete()
     .eq('chat_id', chatId);
-  if (error) throw error;
+  if (error) {
+    logger.error(`Error en clearUserState: ${error.message}`);
+    throw error;
+  }
 }
 
 // ================== SUBIR IMAGEN A SUPABASE STORAGE ==================
@@ -242,7 +256,7 @@ bot.onText(/\/start/, async (msg) => {
       + '• Asistente IA para consultas (solo premium).\n\n'
       + '🎯 <b>Planes:</b>\n'
       + '🆓 <b>Básico (gratis):</b> 5 señales por sesión, estadísticas desde tu registro.\n'
-      + '⭐ <b>Premium (3000 CUP/mes):</b> 10 señales por sesión, estadísticas completas, acceso a IA.\n\n'
+      + '⭐ <b>Premium (3000 CUP/mes):</b> 10 señales por sesión, estadísticas completas, acceso a IA, búsqueda de señales.\n\n'
       + 'Para contratar, usa el botón 📊 Planes del menú.';
     await bot.sendMessage(
       chatId,
@@ -264,23 +278,36 @@ bot.on('message', async (msg) => {
   const username = msg.from.username;
 
   try {
-    // Verificar si hay estado pendiente
+    // Verificar si hay estado pendiente (esto debe ir primero)
     const state = await getUserState(chatId);
+    logger.info(`Mensaje de ${telegramId}: "${text}" - Estado: ${JSON.stringify(state)}`);
+
     if (state) {
+      // Procesar según el paso
       if (state.step === 'awaiting_quotex_free' || state.step === 'awaiting_quotex_premium') {
         await handleQuotexResponse(chatId, telegramId, username, text, state.step);
+        return;
+      } else if (state.step === 'awaiting_phone') {
+        await handlePhoneResponse(chatId, telegramId, text, state.data);
         return;
       } else if (state.step === 'reject_reason') {
         await handleRejectReason(chatId, telegramId, text, state.data);
         return;
+      } else if (state.step === 'signal_asset') {
+        await handleSignalAsset(chatId, telegramId, text, state.data);
+        return;
+      } else if (state.step === 'search_signal') {
+        await handleSearchSignal(chatId, telegramId, text);
+        return;
       }
+      // Si el estado no es ninguno de estos, lo limpiamos
       await clearUserState(chatId);
     }
 
+    // Si no hay estado, procesamos opciones del menú
     const user = await getUser(telegramId);
     if (!user) return bot.sendMessage(chatId, '❌ Usa /start primero.');
 
-    // Opciones del menú
     if (text === '📊 Planes') {
       const keyboard = {
         inline_keyboard: [
@@ -296,12 +323,20 @@ bot.on('message', async (msg) => {
     else if (text === '📜 Historial') {
       await handleHistorial(chatId, user);
     }
+    else if (text === '🔍 Buscar señal') {
+      if (user.membership !== 'premium') {
+        return bot.sendMessage(chatId, '❌ Esta función es solo para usuarios premium.');
+      }
+      await setUserState(chatId, 'search_signal', {});
+      await bot.sendMessage(chatId, '🔍 <b>Ingresa el ID de la señal que deseas buscar:</b>', { parse_mode: 'HTML' });
+    }
     else if (text === '❓ Ayuda') {
       await bot.sendMessage(chatId, 
         '❓ <b>Ayuda</b>\n\n'
         + '📊 Planes: Ver y contratar membresías.\n'
         + '📈 Estadísticas: Rendimiento según tu plan.\n'
         + '📜 Historial: Últimas señales recibidas.\n'
+        + '🔍 Buscar señal: Premium - consulta detalles de una señal por ID.\n'
         + '🔧 Panel Admin: Solo para administradores.\n\n'
         + 'Para más información, contacta al admin.',
         { parse_mode: 'HTML' }
@@ -327,6 +362,17 @@ bot.on('message', async (msg) => {
 });
 
 // ================== FUNCIONES AUXILIARES ==================
+async function hasActiveRequest(userId) {
+  const { data, error } = await supabase
+    .from('membership_requests')
+    .select('id')
+    .eq('user_id', userId)
+    .in('status', ['pending', 'pending_payment'])
+    .maybeSingle();
+  if (error) throw error;
+  return !!data;
+}
+
 async function handleQuotexResponse(chatId, telegramId, username, quotexId, step) {
   if (!isValidQuotexId(quotexId)) {
     return bot.sendMessage(chatId, '❌ <b>ID de Quotex no válido.</b>\nDebe tener entre 6 y 20 caracteres alfanuméricos.', { parse_mode: 'HTML' });
@@ -335,9 +381,13 @@ async function handleQuotexResponse(chatId, telegramId, username, quotexId, step
   const user = await getUser(telegramId);
   if (!user) return bot.sendMessage(chatId, '❌ Error: usuario no encontrado.');
 
+  // Verificar si ya tiene una solicitud activa
+  if (await hasActiveRequest(user.id)) {
+    return bot.sendMessage(chatId, '⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada antes de crear otra.', { parse_mode: 'HTML' });
+  }
+
   await supabase.from('users').update({ quotex_id: quotexId }).eq('id', user.id);
 
-  // Determinar estado de la solicitud según el tipo
   const status = (step === 'awaiting_quotex_free') ? 'pending' : 'pending_payment';
 
   const { data: req, error } = await supabase
@@ -352,47 +402,46 @@ async function handleQuotexResponse(chatId, telegramId, username, quotexId, step
 
   if (error) throw error;
 
-  // Mensaje de confirmación
   await bot.sendMessage(chatId, '✅ <b>ID recibido.</b>\n' + 
     (step === 'awaiting_quotex_free' 
       ? 'Tu solicitud ha sido enviada al admin. Espera la confirmación.' 
       : 'Ahora sigue los pasos para completar el pago.'), 
     { parse_mode: 'HTML' });
 
-  // Si es premium, enviar instrucciones de pago inmediatamente
   if (step === 'awaiting_quotex_premium') {
+    // Instrucciones de pago detalladas
     await bot.sendMessage(chatId,
       '💰 <b>Instrucciones para el pago premium:</b>\n\n'
-      + '1. Realiza un depósito de <b>3000 CUP</b> a la tarjeta **** **** **** 1234.\n'
-      + '2. Envía tu número de teléfono con el comando:\n<code>/enviar_telefono &lt;número&gt;</code>\n'
-      + '3. Luego envía la captura de la transferencia como foto.\n\n'
-      + 'Una vez recibamos la captura, el admin la verificará y activará tu membresía.',
-      { parse_mode: 'HTML' }
+      + '1. Realiza una transferencia de <b>3000 CUP</b> a la siguiente tarjeta:\n'
+      + '<code>**** **** **** 1234</code>\n'
+      + '2. En Transfermóvil, <b>activa la casilla "Mostrar número al destinatario"</b> para que podamos verificar tu pago.\n'
+      + '3. Luego, presiona el botón "📞 Enviar número" y escribe el número de teléfono desde el cual realizaste la transferencia.\n\n'
+      + '⬇️ Presiona el botón para continuar.',
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📞 Enviar número', callback_data: 'send_phone' }]] } }
     );
+    // Guardamos el request_id en el estado para asociarlo luego
+    await setUserState(chatId, 'awaiting_phone_init', { requestId: req.id });
+  } else {
+    // Free: notificar al admin
+    await notifyAdminNewRequest(req.id, username, telegramId, quotexId, req.type);
   }
 
-  await clearUserState(chatId);
+  await clearUserState(chatId); // limpiamos el estado anterior
+}
 
-  // Notificar a los admins con un botón al panel
-  for (const adminId of adminIds) {
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: '🌐 Ir al Panel Web', url: `${BASE_URL}/admin?telegram_id=${adminId}` }
-        ]
-      ]
-    };
-    await bot.sendMessage(
-      adminId,
-      `📨 <b>Nueva solicitud de membresía</b>\n\n`
-      + `👤 Usuario: ${username ? '@' + username : telegramId}\n`
-      + `🆔 ID Telegram: <code>${telegramId}</code>\n`
-      + `📋 Tipo: ${req.type === 'free' ? '🆓 Básico' : '⭐ Premium'}\n`
-      + `🔑 ID Quotex: <code>${quotexId}</code>\n`
-      + `📌 Estado: ${req.status === 'pending' ? 'Pendiente de aprobación' : 'Esperando pago'}`,
-      { reply_markup: keyboard, parse_mode: 'HTML' }
-    );
+async function handlePhoneResponse(chatId, telegramId, phone, data) {
+  const requestId = data.requestId;
+  if (!/^[0-9]{8,12}$/.test(phone)) {
+    return bot.sendMessage(chatId, '❌ <b>Número no válido.</b> Debe tener 8-12 dígitos.', { parse_mode: 'HTML' });
   }
+
+  await supabase
+    .from('membership_requests')
+    .update({ phone_number: phone })
+    .eq('id', requestId);
+
+  await bot.sendMessage(chatId, '✅ <b>Número guardado.</b>\nAhora envía la captura de la transferencia como foto.', { parse_mode: 'HTML' });
+  await setUserState(chatId, 'awaiting_screenshot', { requestId });
 }
 
 async function handleRejectReason(chatId, telegramId, reason, data) {
@@ -419,6 +468,45 @@ async function handleRejectReason(chatId, telegramId, reason, data) {
     logger.error(`Error en rechazo: ${err.message}`);
     await bot.sendMessage(chatId, '❌ Error al procesar rechazo.');
   }
+}
+
+async function handleSignalAsset(chatId, telegramId, asset, data) {
+  if (!asset || asset.length < 2) {
+    return bot.sendMessage(chatId, '❌ Activo no válido. Intenta de nuevo.');
+  }
+  // Guardamos el nuevo estado con el activo en mayúsculas
+  await setUserState(chatId, 'signal_timeframe', { ...data, asset: asset.toUpperCase() });
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '⏱️ 30s', callback_data: 'tf_30s' }, { text: '⏱️ 1M', callback_data: 'tf_1M' }],
+      [{ text: '⏱️ 2M', callback_data: 'tf_2M' }, { text: '⏱️ 5M', callback_data: 'tf_5M' }],
+    ],
+  };
+  await bot.sendMessage(chatId, '📊 <b>Selecciona temporalidad:</b>', { reply_markup: keyboard, parse_mode: 'HTML' });
+}
+
+async function handleSearchSignal(chatId, telegramId, text) {
+  const signalId = parseInt(text);
+  if (isNaN(signalId) || signalId < 1) {
+    return bot.sendMessage(chatId, '❌ ID no válido. Debe ser un número entero positivo.', { parse_mode: 'HTML' });
+  }
+  const { data: signal, error } = await supabase
+    .from('signals')
+    .select('*')
+    .eq('id', signalId)
+    .single();
+  if (error || !signal) {
+    return bot.sendMessage(chatId, '❌ No se encontró ninguna señal con ese ID.', { parse_mode: 'HTML' });
+  }
+  const emoji = signal.direction === 'up' ? '⬆️' : '⬇️';
+  const resultText = signal.result ? (signal.result === 'profit' ? '✅ Profit' : '❌ Loss') : '⏳ Pendiente';
+  const textResponse = `📈 <b>Señal #${signal.id}</b>\n`
+    + `💰 Activo: ${signal.asset}\n`
+    + `⏱️ Tiempo: ${signal.timeframe}\n`
+    + `📊 Dirección: ${emoji}\n`
+    + `📌 Resultado: ${resultText}`;
+  await bot.sendMessage(chatId, textResponse, { parse_mode: 'HTML' });
+  await clearUserState(chatId);
 }
 
 async function handleEstadisticas(chatId, user) {
@@ -452,7 +540,7 @@ async function handleHistorial(chatId, user) {
   const { data: deliveries, error } = await supabase
     .from('signal_deliveries')
     .select(`
-      signal:signals!inner(signal_index, asset, timeframe, direction, result)
+      signal:signals!inner(id, signal_index, asset, timeframe, direction, result)
     `)
     .eq('user_id', user.id)
     .order('delivered_at', { ascending: false })
@@ -467,9 +555,33 @@ async function handleHistorial(chatId, user) {
     const s = d.signal;
     const emoji = s.direction === 'up' ? '⬆️' : '⬇️';
     const result = s.result ? (s.result === 'profit' ? '✅' : '❌') : '⏳';
-    return `#${s.signal_index} ${s.asset} ${s.timeframe} ${emoji} ${result}`;
+    return `#${s.id} ${s.asset} ${s.timeframe} ${emoji} ${result}`;
   });
   await bot.sendMessage(chatId, '📜 <b>Últimas señales:</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
+}
+
+async function notifyAdminNewRequest(requestId, username, telegramId, quotexId, type) {
+  for (const adminId of adminIds) {
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: '✅ Aprobar', callback_data: `approve_${requestId}` },
+          { text: '❌ Rechazar', callback_data: `reject_${requestId}` }
+        ],
+        [{ text: '🌐 Ir al Panel Web', url: `${BASE_URL}/admin?telegram_id=${adminId}` }]
+      ]
+    };
+    await bot.sendMessage(
+      adminId,
+      `📨 <b>Nueva solicitud de membresía</b>\n\n`
+      + `👤 Usuario: ${username ? '@' + username : telegramId}\n`
+      + `🆔 ID Telegram: <code>${telegramId}</code>\n`
+      + `📋 Tipo: ${type === 'free' ? '🆓 Básico' : '⭐ Premium'}\n`
+      + `🔑 ID Quotex: <code>${quotexId}</code>\n`
+      + `📌 Estado: Pendiente de aprobación`,
+      { reply_markup: keyboard, parse_mode: 'HTML' }
+    );
+  }
 }
 
 // ================== MANEJADOR DE CALLBACKS ==================
@@ -485,9 +597,13 @@ bot.on('callback_query', async (callbackQuery) => {
 
   try {
     const user = await getOrCreateUser(telegramId, username);
+    logger.info(`Callback: data=${data}, chatId=${chatId}, telegramId=${telegramId}`);
 
     // ===== PLANES =====
     if (data === 'plan_free') {
+      if (await hasActiveRequest(user.id)) {
+        return bot.editMessageText('⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada.', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+      }
       await bot.editMessageText(
         '🆓 <b>Plan Básico (Gratis)</b>\n\n'
         + '📌 <b>Requisitos:</b>\n'
@@ -501,6 +617,9 @@ bot.on('callback_query', async (callbackQuery) => {
       await setUserState(chatId, 'awaiting_quotex_free', { userId: user.id });
     }
     else if (data === 'plan_premium') {
+      if (await hasActiveRequest(user.id)) {
+        return bot.editMessageText('⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada.', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+      }
       await bot.editMessageText(
         '⭐ <b>Plan Premium (3000 CUP/mes)</b>\n\n'
         + '📌 <b>Requisitos:</b>\n'
@@ -514,8 +633,17 @@ bot.on('callback_query', async (callbackQuery) => {
       );
       await setUserState(chatId, 'awaiting_quotex_premium', { userId: user.id });
     }
+    else if (data === 'send_phone') {
+      const state = await getUserState(chatId);
+      if (!state || state.step !== 'awaiting_phone_init') return;
+      await setUserState(chatId, 'awaiting_phone', { requestId: state.data.requestId });
+      await bot.editMessageText(
+        '📞 <b>Envía el número de teléfono</b> desde el cual realizaste la transferencia (solo dígitos):',
+        { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
+      );
+    }
 
-    // ===== ADMIN: APROBAR/RECHAZAR (solo para free) =====
+    // ===== ADMIN: APROBAR/RECHAZAR (solo free) =====
     else if (data.startsWith('approve_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[1]);
       const { data: req, error } = await supabase
@@ -538,7 +666,6 @@ bot.on('callback_query', async (callbackQuery) => {
         await bot.editMessageText(`✅ Solicitud #${reqId} aprobada (gratis).`, { chat_id: chatId, message_id: messageId });
         await bot.sendMessage(req.user.telegram_id, '✅ <b>¡Felicidades!</b> Tu solicitud básica ha sido aprobada. Ya puedes recibir señales.', { parse_mode: 'HTML' });
       } else {
-        // Para premium no se usa este callback
         await bot.editMessageText('⚠️ Para aprobar un premium, usa el botón de pago.', { chat_id: chatId, message_id: messageId });
       }
     }
@@ -547,6 +674,8 @@ bot.on('callback_query', async (callbackQuery) => {
       await setUserState(chatId, 'reject_reason', { reqId });
       await bot.editMessageText('✏️ <b>Envía el motivo del rechazo:</b>', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
     }
+
+    // ===== ADMIN: PAGOS =====
     else if (data.startsWith('pay_accept_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[2]);
       const { data: req } = await supabase
@@ -633,7 +762,7 @@ bot.on('callback_query', async (callbackQuery) => {
       const tf = data.split('_')[1];
       const state = await getUserState(chatId);
       if (!state || !state.data || !state.data.asset) return;
-      await setUserState(chatId, 'signal_timeframe', { ...state.data, timeframe: tf });
+      await setUserState(chatId, 'signal_direction', { ...state.data, timeframe: tf });
       const keyboard = {
         inline_keyboard: [
           [{ text: '⬆️ Arriba', callback_data: 'dir_up' }],
@@ -648,25 +777,38 @@ bot.on('callback_query', async (callbackQuery) => {
       if (!state || !state.data || !state.data.asset || !state.data.timeframe || !state.data.sessionId) return;
 
       const { asset, timeframe, sessionId } = state.data;
+      
+      // Obtener el último ID de señal global
       const { data: lastSignal } = await supabase
         .from('signals')
-        .select('signal_index')
-        .eq('session_id', sessionId)
-        .order('signal_index', { ascending: false })
+        .select('id')
+        .order('id', { ascending: false })
         .limit(1)
         .maybeSingle();
-      const nextIndex = lastSignal ? lastSignal.signal_index + 1 : 1;
+      const nextId = lastSignal ? lastSignal.id + 1 : 1;
 
       const { data: signal, error } = await supabase
         .from('signals')
-        .insert([{ session_id: sessionId, signal_index: nextIndex, asset, timeframe, direction }])
+        .insert([{ 
+          id: nextId,
+          session_id: sessionId, 
+          signal_index: nextId, 
+          asset, 
+          timeframe, 
+          direction 
+        }])
         .select()
         .single();
       if (error) throw error;
 
       // Obtener usuarios aprobados
       const { data: users } = await supabase.from('users').select('id, telegram_id, membership').eq('approved', true);
-      const { data: sessionSignals } = await supabase.from('signals').select('id').eq('session_id', sessionId);
+      
+      // Obtener señales de esta sesión para contar entregas
+      const { data: sessionSignals } = await supabase
+        .from('signals')
+        .select('id')
+        .eq('session_id', sessionId);
       const signalIds = sessionSignals.map(s => s.id);
 
       for (const user of users || []) {
@@ -679,10 +821,11 @@ bot.on('callback_query', async (callbackQuery) => {
         if (count >= maxAllowed) continue;
 
         const emoji = direction === 'up' ? '⬆️' : '⬇️';
-        const text = `📈 <b>Señal #${nextIndex}</b>\n`
+        const text = `📈 <b>Señal #${signal.id}</b>\n`
                    + `💰 Activo: ${asset}\n`
                    + `⏱️ Tiempo: ${timeframe}\n`
-                   + `📊 Dirección: ${emoji}`;
+                   + `📊 Dirección: ${emoji}\n`
+                   + `📌 Resultado: ⏳ Pendiente`;
         try {
           await bot.sendMessage(user.telegram_id, text, { parse_mode: 'HTML' });
           await supabase.from('signal_deliveries').insert([{ signal_id: signal.id, user_id: user.id }]);
@@ -695,23 +838,23 @@ bot.on('callback_query', async (callbackQuery) => {
           [{ text: '🆕 Nuevo activo', callback_data: 'new_asset' }],
         ],
       };
-      await bot.editMessageText(`✅ <b>Señal #${nextIndex} enviada.</b>\n¿Deseas mantener el activo ${asset}?`, {
+      await bot.editMessageText(`✅ <b>Señal #${signal.id} enviada.</b>\n¿Deseas mantener el activo ${asset}?`, {
         chat_id: chatId,
         message_id: messageId,
         reply_markup: keyboard,
         parse_mode: 'HTML'
       });
+      await clearUserState(chatId);
     }
     else if (data === 'keep_asset' && isAdmin(telegramId)) {
       const state = await getUserState(chatId);
       if (!state || !state.data || !state.data.asset) return;
-      await setUserState(chatId, 'signal_timeframe', { ...state.data });
+      // Para mantener el activo, pasamos a seleccionar tiempo nuevamente
+      await setUserState(chatId, 'signal_timeframe', { ...state.data, asset: state.data.asset });
       const keyboard = {
         inline_keyboard: [
-          [{ text: '⏱️ 30s', callback_data: 'tf_30s' }],
-          [{ text: '⏱️ 1M', callback_data: 'tf_1M' }],
-          [{ text: '⏱️ 2M', callback_data: 'tf_2M' }],
-          [{ text: '⏱️ 5M', callback_data: 'tf_5M' }],
+          [{ text: '⏱️ 30s', callback_data: 'tf_30s' }, { text: '⏱️ 1M', callback_data: 'tf_1M' }],
+          [{ text: '⏱️ 2M', callback_data: 'tf_2M' }, { text: '⏱️ 5M', callback_data: 'tf_5M' }],
         ],
       };
       await bot.editMessageText(`🔄 <b>Manteniendo activo:</b> ${state.data.asset}\nSelecciona temporalidad:`, {
@@ -751,25 +894,21 @@ bot.on('callback_query', async (callbackQuery) => {
     else if (data === 'admin_pending_results' && isAdmin(telegramId)) {
       const { data: signals } = await supabase
         .from('signals')
-        .select('id, signal_index, asset, timeframe')
+        .select('id, asset, timeframe, direction')
         .is('result', null)
-        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
         .limit(20);
       if (!signals || signals.length === 0) {
         return bot.editMessageText('🎯 No hay señales pendientes de resultado.', { chat_id: chatId, message_id: messageId });
       }
+      // Mostrar lista
+      let list = '🎯 <b>Señales pendientes (últimas 20):</b>\n';
       for (const s of signals) {
-        const keyboard = {
-          inline_keyboard: [
-            [
-              { text: '✅ Profit', callback_data: `result_${s.id}_profit` },
-              { text: '❌ Loss', callback_data: `result_${s.id}_loss` },
-            ],
-          ],
-        };
-        await bot.sendMessage(chatId, `Señal #${s.signal_index} - ${s.asset} ${s.timeframe}`, { reply_markup: keyboard });
+        list += `#${s.id} - ${s.asset} ${s.timeframe} ${s.direction === 'up' ? '⬆️' : '⬇️'}\n`;
       }
-      await bot.deleteMessage(chatId, messageId);
+      await bot.sendMessage(chatId, list, { parse_mode: 'HTML' });
+      // Instrucción para marcar resultado
+      await bot.sendMessage(chatId, 'Para marcar resultado, usa el comando:\n<code>/resultado &lt;ID&gt; profit/loss</code>\n\nEjemplo: /resultado 161 profit', { parse_mode: 'HTML' });
     }
 
   } catch (error) {
@@ -778,66 +917,58 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 });
 
-// ================== COMANDOS DE REGISTRO ==================
-bot.onText(/\/enviar_telefono (.+)/, async (msg, match) => {
+// ================== COMANDO PARA RESULTADOS (ADMIN) ==================
+bot.onText(/\/resultado (\d+) (profit|loss)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const telegramId = msg.from.id;
-  const phone = match[1].trim();
-
+  if (!isAdmin(telegramId)) return;
+  const signalId = parseInt(match[1]);
+  const result = match[2];
   try {
-    if (!/^[0-9]{8,12}$/.test(phone)) {
-      return bot.sendMessage(chatId, '❌ <b>Número no válido.</b> Debe tener 8-12 dígitos.', { parse_mode: 'HTML' });
-    }
-    const user = await getUser(telegramId);
-    if (!user) return bot.sendMessage(chatId, '❌ Primero usa /planes.');
-    const { data: req } = await supabase
-      .from('membership_requests')
-      .select('id')
-      .eq('user_id', user.id)
-      .eq('type', 'premium')
-      .eq('status', 'pending_payment')
-      .maybeSingle();
-    if (!req) return bot.sendMessage(chatId, '❌ No tienes una solicitud premium pendiente de pago.');
-    await supabase.from('membership_requests').update({ phone_number: phone }).eq('id', req.id);
-    await bot.sendMessage(chatId, '✅ <b>Número guardado.</b>\nAhora envía la captura de la transferencia como foto.', { parse_mode: 'HTML' });
-  } catch (error) {
-    logger.error(`Error en /enviar_telefono: ${error.message}`);
-    await bot.sendMessage(chatId, '❌ Error al procesar.');
+    const { data: signal, error } = await supabase
+      .from('signals')
+      .update({ result })
+      .eq('id', signalId)
+      .select()
+      .single();
+    if (error) throw error;
+    await bot.sendMessage(chatId, `✅ Resultado de señal #${signalId} guardado: ${result === 'profit' ? '✅ Profit' : '❌ Loss'}`);
+  } catch (err) {
+    logger.error(`Error en /resultado: ${err.message}`);
+    await bot.sendMessage(chatId, '❌ Error al guardar resultado. Verifica que el ID exista.');
   }
 });
 
-// Manejador de fotos
+// ================== MANEJADOR DE FOTOS ==================
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
   const telegramId = msg.from.id;
   const photo = msg.photo[msg.photo.length - 1];
 
   try {
+    const state = await getUserState(chatId);
+    if (!state || state.step !== 'awaiting_screenshot') return;
+
     const user = await getUser(telegramId);
     if (!user) return;
-    const { data: req } = await supabase
-      .from('membership_requests')
-      .select('id')
-      .eq('user_id', user.id)
-      .eq('type', 'premium')
-      .eq('status', 'pending_payment')
-      .maybeSingle();
-    if (!req) return;
 
     const publicUrl = await uploadPhotoToSupabase(photo.file_id, user.id);
     await supabase
       .from('membership_requests')
       .update({ payment_screenshot_file_id: publicUrl })
-      .eq('id', req.id);
+      .eq('id', state.data.requestId);
 
     await bot.sendMessage(chatId, '✅ <b>Captura recibida.</b>\nEspera la confirmación del admin.', { parse_mode: 'HTML' });
+    await clearUserState(chatId);
 
-    const { data: reqData } = await supabase
+    // Obtener datos de la solicitud
+    const { data: req } = await supabase
       .from('membership_requests')
-      .select('phone_number')
-      .eq('id', req.id)
+      .select('*, user:users(*)')
+      .eq('id', state.data.requestId)
       .single();
 
+    // Notificar a los admins con botones de pago
     for (const adminId of adminIds) {
       const keyboard = {
         inline_keyboard: [
@@ -851,7 +982,7 @@ bot.on('photo', async (msg) => {
         adminId,
         publicUrl,
         {
-          caption: `📸 <b>Nuevo pago recibido</b>\n\n👤 Usuario: @${msg.from.username || telegramId}\n📞 Teléfono: ${reqData?.phone_number || 'No especificado'}\n🆔 Solicitud #${req.id}`,
+          caption: `📸 <b>Nuevo pago recibido</b>\n\n👤 Usuario: @${msg.from.username || telegramId}\n📞 Teléfono: ${req.phone_number || 'No especificado'}\n🆔 Solicitud #${req.id}\n⭐ Plan Premium`,
           reply_markup: keyboard,
           parse_mode: 'HTML'
         }
