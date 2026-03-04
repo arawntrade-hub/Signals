@@ -8,6 +8,7 @@ const FormData = require('form-data');
 const { v4: uuidv4 } = require('uuid');
 const winston = require('winston');
 const path = require('path');
+const OpenAI = require('openai');
 
 // ================== CONFIGURACIÓN ==================
 const token = process.env.TELEGRAM_TOKEN;
@@ -18,6 +19,8 @@ const openRouterKey = process.env.OPENROUTER_API_KEY;
 const cubaTz = process.env.CUBA_TZ || 'America/Havana';
 const BASE_URL = process.env.BASE_URL || 'http://localhost:' + (process.env.PORT || 3000);
 const PORT = process.env.PORT || 3000;
+const SITE_URL = process.env.SITE_URL || BASE_URL;
+const SITE_NAME = process.env.SITE_NAME || 'Trading Signals Bot';
 
 // Configuración de logs
 const logger = winston.createLogger({
@@ -39,6 +42,16 @@ const bot = new TelegramBot(token, { polling: true });
 
 // Inicializar Supabase
 const supabase = createClient(supabaseUrl, supabaseKey);
+
+// Inicializar OpenAI (OpenRouter)
+const openai = new OpenAI({
+  baseURL: 'https://openrouter.ai/api/v1',
+  apiKey: openRouterKey,
+  defaultHeaders: {
+    'HTTP-Referer': SITE_URL,
+    'X-OpenRouter-Title': SITE_NAME,
+  },
+});
 
 // Crear bucket si no existe
 async function ensureBucket() {
@@ -101,7 +114,7 @@ const mainMenuKeyboard = {
     keyboard: [
       [{ text: '📊 Planes' }, { text: '📈 Estadísticas' }],
       [{ text: '📜 Historial' }, { text: '❓ Ayuda' }],
-      [{ text: '🔍 Buscar señal' }]
+      [{ text: '🔍 Buscar señal' }, { text: '🤖 Kheel IA' }]
     ],
     resize_keyboard: true,
     one_time_keyboard: false
@@ -113,7 +126,8 @@ const adminMenuKeyboard = {
     keyboard: [
       [{ text: '📊 Planes' }, { text: '📈 Estadísticas' }],
       [{ text: '📜 Historial' }, { text: '❓ Ayuda' }],
-      [{ text: '🔧 Panel Admin' }, { text: '🔍 Buscar señal' }]
+      [{ text: '🔧 Panel Admin' }, { text: '🔍 Buscar señal' }],
+      [{ text: '🤖 Kheel IA' }]
     ],
     resize_keyboard: true
   }
@@ -179,52 +193,88 @@ async function uploadPhotoToSupabase(fileId, userId) {
   }
 }
 
-// ================== IA (SOLO PREMIUM) ==================
-async function askIA(userId, userMessage) {
-  const { data: history } = await supabase
+// ================== IA KHEEL (MÚLTIPLES MODELOS) ==================
+function chooseModel(userMessage, hasImage = false) {
+  if (hasImage) {
+    return 'qwen/qwen3-vl-30b-a3b-thinking';
+  }
+  const lower = userMessage.toLowerCase();
+  if (lower.includes('calcular') || lower.includes('matemática') || lower.includes('probabilidad') || lower.includes('riesgo') || lower.includes('fórmula')) {
+    return 'nvidia/nemotron-3-nano-30b-a3b:free';
+  }
+  if (lower.includes('estrategia') || lower.includes('plan') || lower.includes('curso') || lower.includes('aprender') || lower.includes('estudiar')) {
+    return 'qwen/qwen3-235b-a22b-thinking-2507';
+  }
+  return 'arcee-ai/trinity-large-preview:free';
+}
+
+async function askKheel(userId, userMessage, imageUrl = null) {
+  const { data: history, error } = await supabase
     .from('user_conversations')
     .select('role, content')
     .eq('user_id', userId)
     .order('created_at', { ascending: false })
-    .limit(10);
+    .limit(20);
 
-  const messages = [
-    {
-      role: 'system',
-      content: `Eres un asistente experto en trading de opciones binarias. 
-Responde siempre con emojis y formato amigable.
-Temas: análisis técnico, fundamental, gestión de riesgo, psicología, estrategias.
-Nunca des consejos de inversión personalizados.
-Si el usuario comparte una noticia, analiza su posible impacto en el mercado.`
-    }
-  ];
+  if (error) {
+    logger.error(`Error obteniendo historial IA: ${error.message}`);
+  }
 
-  if (history) {
+  const messages = [];
+
+  messages.push({
+    role: 'system',
+    content: `Eres Kheel, un asistente experto en trading de opciones binarias. 
+Tu personalidad es amigable, educativa y motivadora. 
+Hablas en español y usas emojis para hacer la conversación más amena.
+
+Tus funciones incluyen:
+- Enseñar análisis técnico y fundamental.
+- Ayudar con gestión de riesgo y psicología del trading.
+- Crear estrategias personalizadas según el nivel del usuario.
+- Recomendar recursos (videos, documentos, libros).
+- Analizar noticias que el usuario comparta.
+- Jugar juegos educativos (trivial, preguntas) si el usuario lo desea.
+- Responder preguntas sobre el mercado y opciones binarias.
+
+Siempre debes tratar de conocer el nivel del usuario (principiante, intermedio, avanzado) para adaptar tus respuestas.
+Si el usuario no especifica, puedes preguntarle.
+Puedes sugerir un plan de estudio o ejercicios prácticos.
+Nunca des consejos de inversión personalizados ni prometas resultados.
+Si el usuario envía una imagen (gráfico, noticia), analízala y comenta lo que veas relevante.`
+  });
+
+  if (history && history.length > 0) {
     const reversed = history.reverse();
     for (const msg of reversed) {
       messages.push({ role: msg.role, content: msg.content });
     }
   }
-  messages.push({ role: 'user', content: userMessage });
+
+  if (imageUrl) {
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: userMessage || '¿Qué ves en esta imagen?' },
+        { type: 'image_url', image_url: { url: imageUrl } }
+      ]
+    });
+  } else {
+    messages.push({ role: 'user', content: userMessage });
+  }
+
+  const model = chooseModel(userMessage, !!imageUrl);
+  logger.info(`Kheel usando modelo: ${model}`);
 
   try {
-    const response = await axios.post(
-      'https://openrouter.ai/api/v1/chat/completions',
-      {
-        model: 'mistralai/mistral-7b-instruct',
-        messages,
-        max_tokens: 700,
-        temperature: 0.7,
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${openRouterKey}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
+    const completion = await openai.chat.completions.create({
+      model,
+      messages,
+      max_tokens: 1500,
+      temperature: 0.8,
+    });
 
-    const reply = response.data.choices[0].message.content;
+    const reply = completion.choices[0].message.content;
 
     await supabase.from('user_conversations').insert([
       { user_id: userId, role: 'user', content: userMessage },
@@ -233,24 +283,37 @@ Si el usuario comparte una noticia, analiza su posible impacto en el mercado.`
 
     return reply;
   } catch (err) {
-    logger.error(`Error en IA: ${err.message}`);
+    logger.error(`Error en Kheel: ${err.message}`);
     throw err;
   }
 }
 
-// ================== MENSAJE DE BIENVENIDA PREMIUM ==================
-async function sendPremiumWelcome(chatId) {
+async function startKheelConversation(chatId, userId) {
   const welcomeMessage = 
-    '🎉 <b>¡Bienvenido a la membresía PREMIUM!</b>\n\n'
-    + 'Ahora tienes acceso a todas las funcionalidades exclusivas:\n\n'
-    + '📈 <b>Señales completas:</b> Recibirás hasta 10 señales por sesión (en lugar de 5).\n'
-    + '📊 <b>Estadísticas globales:</b> Puedes ver el historial completo de todas las señales desde el inicio del bot.\n'
-    + '🤖 <b>Asistente IA:</b> Puedes hacerme preguntas sobre trading, análisis técnico, gestión de riesgo, psicología, estrategias, etc. Simplemente escríbeme cualquier mensaje y te responderé (fuera de los horarios de trading).\n'
-    + '🔍 <b>Búsqueda de señales:</b> Usa el botón "🔍 Buscar señal" en el menú y escribe el ID de una señal para ver sus detalles.\n'
-    + '📚 <b>Contenido exclusivo:</b> Pronto añadiremos material educativo y estrategias probadas.\n\n'
-    + 'Para comenzar, explora el menú o simplemente hazme una pregunta sobre trading. ¡Disfruta de la experiencia premium!';
+    '🤖 *¡Hola! Soy Kheel, tu asistente personal de trading.*\n\n'
+    + 'Estoy aquí para ayudarte a mejorar tus conocimientos y habilidades en opciones binarias.\n\n'
+    + 'Para empezar, cuéntame:\n\n'
+    + '1️⃣ ¿Cuál es tu nivel de experiencia? (Principiante, Intermedio, Avanzado)\n'
+    + '2️⃣ ¿Qué te gustaría aprender o mejorar? (Ej: análisis técnico, gestión de riesgo, psicología, estrategias...)\n'
+    + '3️⃣ ¿Tienes algún objetivo específico?\n\n'
+    + 'Responde con libertad, así puedo personalizar tu experiencia. 😊';
   
-  await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
+}
+
+async function sendPremiumWelcome(chatId, userId) {
+  const welcomeMessage = 
+    '🎉 *¡Bienvenido a la membresía PREMIUM!*\n\n'
+    + 'Ahora tienes acceso a:\n'
+    + '📈 *10 señales por sesión* (en lugar de 5).\n'
+    + '📊 *Estadísticas globales* desde el inicio del bot.\n'
+    + '🤖 *Kheel IA* - Tu asistente inteligente para aprender y resolver dudas.\n'
+    + '🔍 *Búsqueda de señales* por ID.\n\n'
+    + 'Para comenzar, presiona el botón *🤖 Kheel IA* en el menú y conversa conmigo.\n\n'
+    + '¡Disfruta de la experiencia premium! 🚀';
+  
+  await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
+  await startKheelConversation(chatId, userId);
 }
 
 // ================== COMANDO /START ==================
@@ -263,20 +326,20 @@ bot.onText(/\/start/, async (msg) => {
     const user = await getOrCreateUser(telegramId, username);
     const keyboard = isAdmin(telegramId) ? adminMenuKeyboard : mainMenuKeyboard;
     const welcomeText = 
-      '🚀 <b>¡Bienvenido al Bot de Señales de Trading!</b>\n\n'
-      + '📊 <b>¿Qué ofrecemos?</b>\n'
+      '🚀 *¡Bienvenido al Bot de Señales de Trading!*\n\n'
+      + '📊 *¿Qué ofrecemos?*\n'
       + '• Señales de trading en vivo para opciones binarias.\n'
       + '• Dos sesiones diarias (10:00 AM y 10:00 PM hora Cuba).\n'
       + '• Estadísticas y historial de señales.\n'
-      + '• Asistente IA para consultas (solo premium).\n\n'
-      + '🎯 <b>Planes:</b>\n'
-      + '🆓 <b>Básico (gratis):</b> 5 señales por sesión, estadísticas desde tu registro.\n'
-      + '⭐ <b>Premium (3000 CUP/mes):</b> 10 señales por sesión, estadísticas completas, acceso a IA, búsqueda de señales.\n\n'
-      + 'Para contratar, usa el botón 📊 Planes del menú.';
+      + '• *Kheel IA* - Asistente inteligente para aprender (solo premium).\n\n'
+      + '🎯 *Planes:*\n'
+      + '🆓 *Básico (gratis):* 5 señales por sesión, estadísticas desde tu registro.\n'
+      + '⭐ *Premium (3000 CUP/mes):* 10 señales por sesión, estadísticas completas, acceso a Kheel IA, búsqueda de señales.\n\n'
+      + 'Para contratar, usa el botón *📊 Planes* del menú.';
     await bot.sendMessage(
       chatId,
       welcomeText,
-      { ...keyboard, parse_mode: 'HTML' }
+      { ...keyboard, parse_mode: 'Markdown' }
     );
   } catch (error) {
     logger.error(`Error en /start: ${error.message}`);
@@ -293,12 +356,10 @@ bot.on('message', async (msg) => {
   const username = msg.from.username;
 
   try {
-    // Verificar si hay estado pendiente (esto debe ir primero)
     const state = await getUserState(chatId);
     logger.info(`Mensaje de ${telegramId}: "${text}" - Estado: ${JSON.stringify(state)}`);
 
     if (state) {
-      // Procesar según el paso
       if (state.step === 'awaiting_quotex_free' || state.step === 'awaiting_quotex_premium') {
         await handleQuotexResponse(chatId, telegramId, username, text, state.step);
         return;
@@ -315,11 +376,9 @@ bot.on('message', async (msg) => {
         await handleSearchSignal(chatId, telegramId, text);
         return;
       }
-      // Si el estado no es ninguno de estos, lo limpiamos
       await clearUserState(chatId);
     }
 
-    // Si no hay estado, procesamos opciones del menú
     const user = await getUser(telegramId);
     if (!user) return bot.sendMessage(chatId, '❌ Usa /start primero.');
 
@@ -330,7 +389,7 @@ bot.on('message', async (msg) => {
           [{ text: '⭐ Plan Premium (3000 CUP/mes)', callback_data: 'plan_premium' }],
         ],
       };
-      await bot.sendMessage(chatId, '📋 <b>Elige un plan:</b>', { reply_markup: keyboard, parse_mode: 'HTML' });
+      await bot.sendMessage(chatId, '📋 *Elige un plan:*', { reply_markup: keyboard, parse_mode: 'Markdown' });
     }
     else if (text === '📈 Estadísticas') {
       await handleEstadisticas(chatId, user);
@@ -343,18 +402,25 @@ bot.on('message', async (msg) => {
         return bot.sendMessage(chatId, '❌ Esta función es solo para usuarios premium.');
       }
       await setUserState(chatId, 'search_signal', {});
-      await bot.sendMessage(chatId, '🔍 <b>Ingresa el ID de la señal que deseas buscar:</b>', { parse_mode: 'HTML' });
+      await bot.sendMessage(chatId, '🔍 *Ingresa el ID de la señal que deseas buscar:*', { parse_mode: 'Markdown' });
+    }
+    else if (text === '🤖 Kheel IA') {
+      if (user.membership !== 'premium') {
+        return bot.sendMessage(chatId, '❌ El asistente Kheel es solo para usuarios premium.');
+      }
+      await startKheelConversation(chatId, user.id);
     }
     else if (text === '❓ Ayuda') {
       await bot.sendMessage(chatId, 
-        '❓ <b>Ayuda</b>\n\n'
+        '❓ *Ayuda*\n\n'
         + '📊 Planes: Ver y contratar membresías.\n'
         + '📈 Estadísticas: Rendimiento según tu plan.\n'
         + '📜 Historial: Últimas señales recibidas.\n'
         + '🔍 Buscar señal: Premium - consulta detalles de una señal por ID.\n'
+        + '🤖 Kheel IA: Premium - asistente inteligente para aprender.\n'
         + '🔧 Panel Admin: Solo para administradores.\n\n'
         + 'Para más información, contacta al admin.',
-        { parse_mode: 'HTML' }
+        { parse_mode: 'Markdown' }
       );
     }
     else if (text === '🔧 Panel Admin' && isAdmin(telegramId)) {
@@ -368,7 +434,11 @@ bot.on('message', async (msg) => {
           [{ text: '🌐 Panel web', url: `${BASE_URL}/admin?telegram_id=${telegramId}` }]
         ],
       };
-      await bot.sendMessage(chatId, '🔧 <b>Panel de Administración:</b>', { reply_markup: keyboard, parse_mode: 'HTML' });
+      await bot.sendMessage(chatId, '🔧 *Panel de Administración:*', { reply_markup: keyboard, parse_mode: 'Markdown' });
+    }
+    else if (user.membership === 'premium' && !isAdmin(telegramId)) {
+      const reply = await askKheel(user.id, text);
+      await bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
     }
   } catch (error) {
     logger.error(`Error en message handler: ${error.message}`);
@@ -376,7 +446,7 @@ bot.on('message', async (msg) => {
   }
 });
 
-// ================== FUNCIONES AUXILIARES ==================
+// ================== FUNCIONES AUXILIARES PARA SOLICITUDES Y SEÑALES ==================
 async function hasActiveRequest(userId) {
   const { data, error } = await supabase
     .from('membership_requests')
@@ -390,15 +460,14 @@ async function hasActiveRequest(userId) {
 
 async function handleQuotexResponse(chatId, telegramId, username, quotexId, step) {
   if (!isValidQuotexId(quotexId)) {
-    return bot.sendMessage(chatId, '❌ <b>ID de Quotex no válido.</b>\nDebe tener entre 6 y 20 caracteres alfanuméricos.', { parse_mode: 'HTML' });
+    return bot.sendMessage(chatId, '❌ *ID de Quotex no válido.*\nDebe tener entre 6 y 20 caracteres alfanuméricos.', { parse_mode: 'Markdown' });
   }
 
   const user = await getUser(telegramId);
   if (!user) return bot.sendMessage(chatId, '❌ Error: usuario no encontrado.');
 
-  // Verificar si ya tiene una solicitud activa
   if (await hasActiveRequest(user.id)) {
-    return bot.sendMessage(chatId, '⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada antes de crear otra.', { parse_mode: 'HTML' });
+    return bot.sendMessage(chatId, '⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada antes de crear otra.', { parse_mode: 'Markdown' });
   }
 
   await supabase.from('users').update({ quotex_id: quotexId }).eq('id', user.id);
@@ -417,35 +486,33 @@ async function handleQuotexResponse(chatId, telegramId, username, quotexId, step
 
   if (error) throw error;
 
-  await bot.sendMessage(chatId, '✅ <b>ID recibido.</b>\n' + 
+  await bot.sendMessage(chatId, '✅ *ID recibido.*\n' + 
     (step === 'awaiting_quotex_free' 
       ? 'Tu solicitud ha sido enviada al admin. Espera la confirmación.' 
       : 'Ahora sigue los pasos para completar el pago.'), 
-    { parse_mode: 'HTML' });
+    { parse_mode: 'Markdown' });
 
   if (step === 'awaiting_quotex_premium') {
-    // Instrucciones de pago detalladas con botón que incluye requestId
     await bot.sendMessage(chatId,
-      '💰 <b>Instrucciones para el pago premium:</b>\n\n'
-      + '1. Realiza una transferencia de <b>3000 CUP</b> a la siguiente tarjeta:\n'
-      + '<code>**** **** **** 1234</code>\n'
-      + '2. En Transfermóvil, <b>activa la casilla "Mostrar número al destinatario"</b> para que podamos verificar tu pago.\n'
+      '💰 *Instrucciones para el pago premium:*\n\n'
+      + '1. Realiza una transferencia de *3000 CUP* a la siguiente tarjeta:\n'
+      + '`**** **** **** 1234`\n'
+      + '2. En Transfermóvil, *activa la casilla "Mostrar número al destinatario"* para que podamos verificar tu pago.\n'
       + '3. Luego, presiona el botón "📞 Enviar número" y escribe el número de teléfono desde el cual realizaste la transferencia.\n\n'
       + '⬇️ Presiona el botón para continuar.',
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📞 Enviar número', callback_data: `send_phone_${req.id}` }]] } }
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '📞 Enviar número', callback_data: `send_phone_${req.id}` }]] } }
     );
   } else {
-    // Free: notificar al admin
     await notifyAdminNewRequest(req.id, username, telegramId, quotexId, req.type);
   }
 
-  await clearUserState(chatId); // limpiamos el estado anterior (el de espera de ID)
+  await clearUserState(chatId);
 }
 
 async function handlePhoneResponse(chatId, telegramId, phone, data) {
   const requestId = data.requestId;
   if (!/^[0-9]{8,12}$/.test(phone)) {
-    return bot.sendMessage(chatId, '❌ <b>Número no válido.</b> Debe tener 8-12 dígitos.', { parse_mode: 'HTML' });
+    return bot.sendMessage(chatId, '❌ *Número no válido.* Debe tener 8-12 dígitos.', { parse_mode: 'Markdown' });
   }
 
   await supabase
@@ -453,7 +520,7 @@ async function handlePhoneResponse(chatId, telegramId, phone, data) {
     .update({ phone_number: phone })
     .eq('id', requestId);
 
-  await bot.sendMessage(chatId, '✅ <b>Número guardado.</b>\nAhora envía la captura de la transferencia como foto.', { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, '✅ *Número guardado.*\nAhora envía la captura de la transferencia como foto.', { parse_mode: 'Markdown' });
   await setUserState(chatId, 'awaiting_screenshot', { requestId });
 }
 
@@ -474,7 +541,7 @@ async function handleRejectReason(chatId, telegramId, reason, data) {
       .eq('id', reqId);
 
     if (req) {
-      await bot.sendMessage(req.user.telegram_id, `❌ <b>Tu solicitud ha sido rechazada.</b>\nMotivo: ${reason}`, { parse_mode: 'HTML' });
+      await bot.sendMessage(req.user.telegram_id, `❌ *Tu solicitud ha sido rechazada.*\nMotivo: ${reason}`, { parse_mode: 'Markdown' });
     }
     await bot.sendMessage(chatId, `✅ Rechazo notificado para solicitud #${reqId}.`);
   } catch (err) {
@@ -488,10 +555,8 @@ async function handleSignalAsset(chatId, telegramId, asset, data) {
     return bot.sendMessage(chatId, '❌ Activo no válido. Intenta de nuevo.');
   }
   const assetUpper = asset.toUpperCase();
-  // Notificar a los usuarios aprobados sobre el activo
-  await notifyClients(chatId, `📊 <b>Activo de la próxima señal:</b> ${assetUpper}`, data.sessionId);
+  await notifyClients(chatId, `📊 *Activo de la próxima señal:* ${assetUpper}`, data.sessionId);
   
-  // Guardamos el nuevo estado con el activo en mayúsculas
   await setUserState(chatId, 'signal_timeframe', { ...data, asset: assetUpper });
   const keyboard = {
     inline_keyboard: [
@@ -499,13 +564,13 @@ async function handleSignalAsset(chatId, telegramId, asset, data) {
       [{ text: '⏱️ 2M', callback_data: 'tf_2M' }, { text: '⏱️ 5M', callback_data: 'tf_5M' }],
     ],
   };
-  await bot.sendMessage(chatId, '📊 <b>Selecciona temporalidad:</b>', { reply_markup: keyboard, parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, '📊 *Selecciona temporalidad:*', { reply_markup: keyboard, parse_mode: 'Markdown' });
 }
 
 async function handleSearchSignal(chatId, telegramId, text) {
   const signalId = parseInt(text);
   if (isNaN(signalId) || signalId < 1) {
-    return bot.sendMessage(chatId, '❌ ID no válido. Debe ser un número entero positivo.', { parse_mode: 'HTML' });
+    return bot.sendMessage(chatId, '❌ ID no válido. Debe ser un número entero positivo.', { parse_mode: 'Markdown' });
   }
   const { data: signal, error } = await supabase
     .from('signals')
@@ -513,16 +578,16 @@ async function handleSearchSignal(chatId, telegramId, text) {
     .eq('id', signalId)
     .single();
   if (error || !signal) {
-    return bot.sendMessage(chatId, '❌ No se encontró ninguna señal con ese ID.', { parse_mode: 'HTML' });
+    return bot.sendMessage(chatId, '❌ No se encontró ninguna señal con ese ID.', { parse_mode: 'Markdown' });
   }
   const emoji = signal.direction === 'up' ? '⬆️' : '⬇️';
   const resultText = signal.result ? (signal.result === 'profit' ? '✅ Profit' : '❌ Loss') : '⏳ Pendiente';
-  const textResponse = `📈 <b>Señal #${signal.id}</b>\n`
+  const textResponse = `📈 *Señal #${signal.id}*\n`
     + `💰 Activo: ${signal.asset}\n`
     + `⏱️ Tiempo: ${signal.timeframe}\n`
     + `📊 Dirección: ${emoji}\n`
     + `📌 Resultado: ${resultText}`;
-  await bot.sendMessage(chatId, textResponse, { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, textResponse, { parse_mode: 'Markdown' });
   await clearUserState(chatId);
 }
 
@@ -536,21 +601,21 @@ async function handleEstadisticas(chatId, user) {
 
   const total = signals.length;
   if (total === 0) {
-    return bot.sendMessage(chatId, '📊 <b>No hay suficientes datos aún.</b>', { parse_mode: 'HTML' });
+    return bot.sendMessage(chatId, '📊 *No hay suficientes datos aún.*', { parse_mode: 'Markdown' });
   }
 
   const profits = signals.filter(s => s.result === 'profit').length;
   const losses = signals.filter(s => s.result === 'loss').length;
   const winrate = total > 0 ? ((profits / total) * 100).toFixed(2) : 0;
 
-  let texto = `📊 <b>Estadísticas ${user.membership === 'premium' ? '⭐ PREMIUM' : '🆓 BÁSICAS'}</b>\n\n`;
+  let texto = `📊 *Estadísticas ${user.membership === 'premium' ? '⭐ PREMIUM' : '🆓 BÁSICAS'}*\n\n`;
   texto += `📈 Señales totales: ${total}\n`;
   texto += `✅ Profit: ${profits}\n`;
   texto += `❌ Loss: ${losses}\n`;
   texto += `📊 Winrate: ${winrate}%\n`;
   texto += `⏳ Pendientes: ${total - profits - losses}`;
 
-  await bot.sendMessage(chatId, texto, { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, texto, { parse_mode: 'Markdown' });
 }
 
 async function handleHistorial(chatId, user) {
@@ -565,7 +630,7 @@ async function handleHistorial(chatId, user) {
 
   if (error) throw error;
   if (!deliveries.length) {
-    return bot.sendMessage(chatId, '📭 <b>Aún no has recibido señales.</b>', { parse_mode: 'HTML' });
+    return bot.sendMessage(chatId, '📭 *Aún no has recibido señales.*', { parse_mode: 'Markdown' });
   }
 
   const lines = deliveries.map(d => {
@@ -574,17 +639,15 @@ async function handleHistorial(chatId, user) {
     const result = s.result ? (s.result === 'profit' ? '✅' : '❌') : '⏳';
     return `#${s.id} ${s.asset} ${s.timeframe} ${emoji} ${result}`;
   });
-  await bot.sendMessage(chatId, '📜 <b>Últimas señales:</b>\n' + lines.join('\n'), { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, '📜 *Últimas señales:*\n' + lines.join('\n'), { parse_mode: 'Markdown' });
 }
 
-// Notificar a todos los clientes aprobados (solo los que están en la sesión activa)
 async function notifyClients(chatId, message, sessionId) {
   const { data: users } = await supabase
     .from('users')
     .select('telegram_id, membership, id')
     .eq('approved', true);
   
-  // Obtener señales de esta sesión para contar entregas
   const { data: sessionSignals } = await supabase
     .from('signals')
     .select('id')
@@ -592,17 +655,15 @@ async function notifyClients(chatId, message, sessionId) {
   const signalIds = sessionSignals.map(s => s.id);
 
   for (const user of users || []) {
-    // Contar cuántas señales ha recibido en esta sesión
     const { count } = await supabase
       .from('signal_deliveries')
       .select('*', { count: 'exact', head: true })
       .eq('user_id', user.id)
       .in('signal_id', signalIds);
     const maxAllowed = user.membership === 'premium' ? 10 : 5;
-    // Solo notificamos si aún puede recibir señales en esta sesión
     if (count < maxAllowed) {
       try {
-        await bot.sendMessage(user.telegram_id, message, { parse_mode: 'HTML' });
+        await bot.sendMessage(user.telegram_id, message, { parse_mode: 'Markdown' });
       } catch (e) { }
     }
   }
@@ -621,13 +682,13 @@ async function notifyAdminNewRequest(requestId, username, telegramId, quotexId, 
     };
     await bot.sendMessage(
       adminId,
-      `📨 <b>Nueva solicitud de membresía</b>\n\n`
+      `📨 *Nueva solicitud de membresía*\n\n`
       + `👤 Usuario: ${username ? '@' + username : telegramId}\n`
-      + `🆔 ID Telegram: <code>${telegramId}</code>\n`
+      + `🆔 ID Telegram: \`${telegramId}\`\n`
       + `📋 Tipo: ${type === 'free' ? '🆓 Básico' : '⭐ Premium'}\n`
-      + `🔑 ID Quotex: <code>${quotexId}</code>\n`
+      + `🔑 ID Quotex: \`${quotexId}\`\n`
       + `📌 Estado: Pendiente de aprobación`,
-      { reply_markup: keyboard, parse_mode: 'HTML' }
+      { reply_markup: keyboard, parse_mode: 'Markdown' }
     );
   }
 }
@@ -650,34 +711,34 @@ bot.on('callback_query', async (callbackQuery) => {
     // ===== PLANES =====
     if (data === 'plan_free') {
       if (await hasActiveRequest(user.id)) {
-        return bot.editMessageText('⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada.', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+        return bot.editMessageText('⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
       }
       await bot.editMessageText(
-        '🆓 <b>Plan Básico (Gratis)</b>\n\n'
-        + '📌 <b>Requisitos:</b>\n'
+        '🆓 *Plan Básico (Gratis)*\n\n'
+        + '📌 *Requisitos:*\n'
         + '1. Regístrate en Quotex con este enlace: [ENLACE_QUOTEX]\n'
-        + '2. La cuenta debe ser <b>totalmente nueva</b>.\n'
+        + '2. La cuenta debe ser *totalmente nueva*.\n'
         + '3. Completa la verificación KYC.\n'
-        + '4. Realiza un depósito mínimo de <b>10 USDT</b> en tu cuenta Quotex.\n\n'
-        + '📤 <i>Luego de registrarte, responde a este mensaje con tu ID de Quotex.</i>',
-        { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
+        + '4. Realiza un depósito mínimo de *10 USDT* en tu cuenta Quotex.\n\n'
+        + '📤 *Luego de registrarte, responde a este mensaje con tu ID de Quotex.*',
+        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' }
       );
       await setUserState(chatId, 'awaiting_quotex_free', { userId: user.id });
     }
     else if (data === 'plan_premium') {
       if (await hasActiveRequest(user.id)) {
-        return bot.editMessageText('⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada.', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+        return bot.editMessageText('⚠️ Ya tienes una solicitud pendiente. Espera a que sea procesada.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
       }
       await bot.editMessageText(
-        '⭐ <b>Plan Premium (3000 CUP/mes)</b>\n\n'
-        + '📌 <b>Requisitos:</b>\n'
+        '⭐ *Plan Premium (3000 CUP/mes)*\n\n'
+        + '📌 *Requisitos:*\n'
         + '1. Regístrate en Quotex con este enlace: [ENLACE_QUOTEX]\n'
-        + '2. Cuenta <b>nueva</b> y verificación KYC.\n'
-        + '3. Depósito mínimo de <b>10 USDT</b> en Quotex.\n\n'
-        + '💰 <b>Pago de membresía:</b> 3000 CUP\n'
+        + '2. Cuenta *nueva* y verificación KYC.\n'
+        + '3. Depósito mínimo de *10 USDT* en Quotex.\n\n'
+        + '💰 *Pago de membresía:* 3000 CUP\n'
         + '4. Después de enviar tu ID de Quotex, recibirás las instrucciones para realizar el pago.\n\n'
-        + '📤 <i>Responde a este mensaje con tu ID de Quotex para comenzar.</i>',
-        { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
+        + '📤 *Responde a este mensaje con tu ID de Quotex para comenzar.*',
+        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' }
       );
       await setUserState(chatId, 'awaiting_quotex_premium', { userId: user.id });
     }
@@ -685,8 +746,8 @@ bot.on('callback_query', async (callbackQuery) => {
       const requestId = parseInt(data.split('_')[2]);
       await setUserState(chatId, 'awaiting_phone', { requestId });
       await bot.editMessageText(
-        '📞 <b>Envía el número de teléfono</b> desde el cual realizaste la transferencia (solo dígitos):',
-        { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
+        '📞 *Envía el número de teléfono* desde el cual realizaste la transferencia (solo dígitos):',
+        { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' }
       );
     }
 
@@ -711,7 +772,7 @@ bot.on('callback_query', async (callbackQuery) => {
           .update({ status: 'approved' })
           .eq('id', reqId);
         await bot.editMessageText(`✅ Solicitud #${reqId} aprobada (gratis).`, { chat_id: chatId, message_id: messageId });
-        await bot.sendMessage(req.user.telegram_id, '✅ <b>¡Felicidades!</b> Tu solicitud básica ha sido aprobada. Ya puedes recibir señales.', { parse_mode: 'HTML' });
+        await bot.sendMessage(req.user.telegram_id, '✅ *¡Felicidades!* Tu solicitud básica ha sido aprobada. Ya puedes recibir señales.', { parse_mode: 'Markdown' });
       } else {
         await bot.editMessageText('⚠️ Para aprobar un premium, usa el botón de pago.', { chat_id: chatId, message_id: messageId });
       }
@@ -719,10 +780,10 @@ bot.on('callback_query', async (callbackQuery) => {
     else if (data.startsWith('reject_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[1]);
       await setUserState(chatId, 'reject_reason', { reqId });
-      await bot.editMessageText('✏️ <b>Envía el motivo del rechazo:</b>', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+      await bot.editMessageText('✏️ *Envía el motivo del rechazo:*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
     }
 
-    // ===== ADMIN: PAGOS (desde foto) =====
+    // ===== ADMIN: PAGOS =====
     else if (data.startsWith('pay_accept_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[2]);
       const { data: req } = await supabase
@@ -732,10 +793,8 @@ bot.on('callback_query', async (callbackQuery) => {
         .single();
       if (!req) return;
 
-      // Quitar los botones del mensaje de la foto (para que no se pueda volver a hacer clic)
       await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId });
 
-      // Actualizar usuario a premium
       const premiumUntil = new Date();
       premiumUntil.setDate(premiumUntil.getDate() + 30);
       await supabase
@@ -747,19 +806,14 @@ bot.on('callback_query', async (callbackQuery) => {
         .update({ status: 'approved' })
         .eq('id', reqId);
 
-      // Confirmar al admin
       await bot.sendMessage(chatId, `✅ Pago aceptado. Usuario premium hasta ${premiumUntil.toLocaleDateString()}.`);
-
-      // Enviar mensaje de bienvenida premium al usuario
-      await sendPremiumWelcome(req.user.telegram_id);
+      await sendPremiumWelcome(req.user.telegram_id, req.user_id);
     }
     else if (data.startsWith('pay_reject_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[2]);
-      // Quitar los botones del mensaje de la foto
       await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId });
-      // Establecer estado para pedir motivo
       await setUserState(chatId, 'reject_reason', { reqId });
-      await bot.sendMessage(chatId, '✏️ <b>Envía el motivo del rechazo del pago:</b>', { parse_mode: 'HTML' });
+      await bot.sendMessage(chatId, '✏️ *Envía el motivo del rechazo del pago:*', { parse_mode: 'Markdown' });
     }
 
     // ===== ADMIN: GESTIÓN DE SESIONES Y SEÑALES =====
@@ -782,7 +836,7 @@ bot.on('callback_query', async (callbackQuery) => {
       await bot.editMessageText('🟢 Sesión abierta manualmente.', { chat_id: chatId, message_id: messageId });
       const { data: users } = await supabase.from('users').select('telegram_id').eq('approved', true);
       for (const u of users || []) {
-        try { await bot.sendMessage(u.telegram_id, '🟢 <b>Sesión de trading INICIADA</b>', { parse_mode: 'HTML' }); } catch (e) { }
+        try { await bot.sendMessage(u.telegram_id, '🟢 *Sesión de trading INICIADA*', { parse_mode: 'Markdown' }); } catch (e) { }
       }
     }
     else if (data === 'admin_close_session' && isAdmin(telegramId)) {
@@ -802,7 +856,7 @@ bot.on('callback_query', async (callbackQuery) => {
       await bot.editMessageText('🔴 Sesión cerrada.', { chat_id: chatId, message_id: messageId });
       const { data: users } = await supabase.from('users').select('telegram_id').eq('approved', true);
       for (const u of users || []) {
-        try { await bot.sendMessage(u.telegram_id, '🔴 <b>Sesión de trading FINALIZADA</b>', { parse_mode: 'HTML' }); } catch (e) { }
+        try { await bot.sendMessage(u.telegram_id, '🔴 *Sesión de trading FINALIZADA*', { parse_mode: 'Markdown' }); } catch (e) { }
       }
     }
     else if (data === 'admin_new_signal' && isAdmin(telegramId)) {
@@ -815,15 +869,14 @@ bot.on('callback_query', async (callbackQuery) => {
         return bot.editMessageText('⚠️ No hay una sesión abierta. Abre una primero.', { chat_id: chatId, message_id: messageId });
       }
       await setUserState(chatId, 'signal_asset', { sessionId: session.id });
-      await bot.editMessageText('✏️ <b>Envía el activo (ej. EURUSD):</b>', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+      await bot.editMessageText('✏️ *Envía el activo (ej. EURUSD):*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
     }
     else if (data.startsWith('tf_') && isAdmin(telegramId)) {
       const tf = data.split('_')[1];
       const state = await getUserState(chatId);
       if (!state || !state.data || !state.data.asset) return;
       const { asset, sessionId } = state.data;
-      // Notificar a clientes sobre la temporalidad
-      await notifyClients(chatId, `⏱️ <b>Tiempo de la señal:</b> ${tf} (${asset})`, sessionId);
+      await notifyClients(chatId, `⏱️ *Tiempo de la señal:* ${tf} (${asset})`, sessionId);
       
       await setUserState(chatId, 'signal_direction', { ...state.data, timeframe: tf });
       const keyboard = {
@@ -832,7 +885,7 @@ bot.on('callback_query', async (callbackQuery) => {
           [{ text: '⬇️ Abajo', callback_data: 'dir_down' }],
         ],
       };
-      await bot.editMessageText('📊 <b>Selecciona dirección:</b>', { chat_id: chatId, message_id: messageId, reply_markup: keyboard, parse_mode: 'HTML' });
+      await bot.editMessageText('📊 *Selecciona dirección:*', { chat_id: chatId, message_id: messageId, reply_markup: keyboard, parse_mode: 'Markdown' });
     }
     else if (data.startsWith('dir_') && isAdmin(telegramId)) {
       const direction = data === 'dir_up' ? 'up' : 'down';
@@ -841,13 +894,10 @@ bot.on('callback_query', async (callbackQuery) => {
 
       const { asset, timeframe, sessionId } = state.data;
       
-      // Notificar a clientes la dirección
       const emojiDir = direction === 'up' ? '⬆️' : '⬇️';
-      await notifyClients(chatId, `📊 <b>Dirección:</b> ${emojiDir}`, sessionId);
+      await notifyClients(chatId, `📊 *Dirección:* ${emojiDir}`, sessionId);
       
-      // Pequeña pausa antes de enviar el ticket
       setTimeout(async () => {
-        // Obtener el último ID de señal global
         const { data: lastSignal } = await supabase
           .from('signals')
           .select('id')
@@ -870,10 +920,8 @@ bot.on('callback_query', async (callbackQuery) => {
           .single();
         if (error) throw error;
 
-        // Obtener usuarios aprobados
         const { data: users } = await supabase.from('users').select('id, telegram_id, membership').eq('approved', true);
         
-        // Obtener señales de esta sesión para contar entregas
         const { data: sessionSignals } = await supabase
           .from('signals')
           .select('id')
@@ -890,19 +938,18 @@ bot.on('callback_query', async (callbackQuery) => {
           if (count >= maxAllowed) continue;
 
           const emoji = direction === 'up' ? '⬆️' : '⬇️';
-          const text = `📈 <b>Señal #${signal.id}</b>\n`
+          const text = `📈 *Señal #${signal.id}*\n`
                      + `💰 Activo: ${asset}\n`
                      + `⏱️ Tiempo: ${timeframe}\n`
                      + `📊 Dirección: ${emoji}\n`
                      + `📌 Resultado: ⏳ Pendiente`;
           try {
-            await bot.sendMessage(user.telegram_id, text, { parse_mode: 'HTML' });
+            await bot.sendMessage(user.telegram_id, text, { parse_mode: 'Markdown' });
             await supabase.from('signal_deliveries').insert([{ signal_id: signal.id, user_id: user.id }]);
           } catch (e) { }
         }
-      }, 3000); // 3 segundos de espera
+      }, 3000);
 
-      // Guardamos estado para manejar opciones de mantener/nuevo activo
       await setUserState(chatId, 'awaiting_choice', { sessionId, asset });
       const keyboard = {
         inline_keyboard: [
@@ -910,11 +957,11 @@ bot.on('callback_query', async (callbackQuery) => {
           [{ text: '🆕 Nuevo activo', callback_data: 'new_asset' }],
         ],
       };
-      await bot.editMessageText(`✅ <b>Señal enviada.</b>\n¿Deseas mantener el activo ${asset}?`, {
+      await bot.editMessageText(`✅ *Señal enviada.*\n¿Deseas mantener el activo ${asset}?`, {
         chat_id: chatId,
         message_id: messageId,
         reply_markup: keyboard,
-        parse_mode: 'HTML'
+        parse_mode: 'Markdown'
       });
     }
     else if (data === 'keep_asset' && isAdmin(telegramId)) {
@@ -923,10 +970,8 @@ bot.on('callback_query', async (callbackQuery) => {
         return bot.editMessageText('⚠️ No hay una sesión activa para mantener. Inicia una nueva señal.', { chat_id: chatId, message_id: messageId });
       }
       const { asset, sessionId } = state.data;
-      // Notificar a clientes que se mantiene el activo
-      await notifyClients(chatId, `🔄 <b>Mantenemos el activo:</b> ${asset}`, sessionId);
+      await notifyClients(chatId, `🔄 *Mantenemos el activo:* ${asset}`, sessionId);
       
-      // Pasamos a pedir temporalidad de nuevo
       await setUserState(chatId, 'signal_timeframe', { sessionId, asset });
       const keyboard = {
         inline_keyboard: [
@@ -934,11 +979,11 @@ bot.on('callback_query', async (callbackQuery) => {
           [{ text: '⏱️ 2M', callback_data: 'tf_2M' }, { text: '⏱️ 5M', callback_data: 'tf_5M' }],
         ],
       };
-      await bot.editMessageText(`🔄 <b>Manteniendo activo:</b> ${asset}\nSelecciona temporalidad:`, {
+      await bot.editMessageText(`🔄 *Manteniendo activo:* ${asset}\nSelecciona temporalidad:`, {
         chat_id: chatId,
         message_id: messageId,
         reply_markup: keyboard,
-        parse_mode: 'HTML'
+        parse_mode: 'Markdown'
       });
     }
     else if (data === 'new_asset' && isAdmin(telegramId)) {
@@ -947,11 +992,10 @@ bot.on('callback_query', async (callbackQuery) => {
         return bot.editMessageText('⚠️ No hay una sesión activa. Inicia una nueva señal.', { chat_id: chatId, message_id: messageId });
       }
       const { sessionId } = state.data;
-      // Notificar a clientes que cambiaremos de activo
-      await notifyClients(chatId, `🆕 <b>Cambiando de activo...</b>`, sessionId);
+      await notifyClients(chatId, `🆕 *Cambiando de activo...*`, sessionId);
       
       await setUserState(chatId, 'signal_asset', { sessionId });
-      await bot.editMessageText('✏️ <b>Envía el nuevo activo (ej. EURUSD):</b>', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+      await bot.editMessageText('✏️ *Envía el nuevo activo (ej. EURUSD):*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
     }
     else if (data.startsWith('result_') && isAdmin(telegramId)) {
       const parts = data.split('_');
@@ -968,11 +1012,11 @@ bot.on('callback_query', async (callbackQuery) => {
       if (!reqs || reqs.length === 0) {
         return bot.editMessageText('📭 No hay solicitudes pendientes.', { chat_id: chatId, message_id: messageId });
       }
-      let texto = '📋 <b>Solicitudes pendientes:</b>\n';
+      let texto = '📋 *Solicitudes pendientes:*\n';
       for (const r of reqs) {
         texto += `#${r.id} - ${r.type === 'free' ? '🆓' : '⭐'} - @${r.user.username || r.user.telegram_id}\n`;
       }
-      await bot.editMessageText(texto, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+      await bot.editMessageText(texto, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
     }
     else if (data === 'admin_pending_results' && isAdmin(telegramId)) {
       const { data: signals } = await supabase
@@ -984,14 +1028,12 @@ bot.on('callback_query', async (callbackQuery) => {
       if (!signals || signals.length === 0) {
         return bot.editMessageText('🎯 No hay señales pendientes de resultado.', { chat_id: chatId, message_id: messageId });
       }
-      // Mostrar lista
-      let list = '🎯 <b>Señales pendientes (últimas 20):</b>\n';
+      let list = '🎯 *Señales pendientes (últimas 20):*\n';
       for (const s of signals) {
         list += `#${s.id} - ${s.asset} ${s.timeframe} ${s.direction === 'up' ? '⬆️' : '⬇️'}\n`;
       }
-      await bot.sendMessage(chatId, list, { parse_mode: 'HTML' });
-      // Instrucción para marcar resultado
-      await bot.sendMessage(chatId, 'Para marcar resultado, usa el comando:\n<code>/resultado &lt;ID&gt; profit/loss</code>\n\nEjemplo: /resultado 161 profit', { parse_mode: 'HTML' });
+      await bot.sendMessage(chatId, list, { parse_mode: 'Markdown' });
+      await bot.sendMessage(chatId, 'Para marcar resultado, usa el comando:\n`/resultado <ID> profit/loss`\n\nEjemplo: `/resultado 161 profit`', { parse_mode: 'Markdown' });
     }
 
   } catch (error) {
@@ -1029,82 +1071,60 @@ bot.on('photo', async (msg) => {
   const photo = msg.photo[msg.photo.length - 1];
 
   try {
+    // Primero, verificar si es para pago premium
     const state = await getUserState(chatId);
-    if (!state || state.step !== 'awaiting_screenshot') return;
+    if (state && state.step === 'awaiting_screenshot') {
+      const user = await getUser(telegramId);
+      if (!user) return;
 
-    const user = await getUser(telegramId);
-    if (!user) return;
+      const publicUrl = await uploadPhotoToSupabase(photo.file_id, user.id);
+      await supabase
+        .from('membership_requests')
+        .update({ payment_screenshot_file_id: publicUrl })
+        .eq('id', state.data.requestId);
 
-    const publicUrl = await uploadPhotoToSupabase(photo.file_id, user.id);
-    await supabase
-      .from('membership_requests')
-      .update({ payment_screenshot_file_id: publicUrl })
-      .eq('id', state.data.requestId);
+      await bot.sendMessage(chatId, '✅ *Captura recibida.*\nEspera la confirmación del admin.', { parse_mode: 'Markdown' });
+      await clearUserState(chatId);
 
-    await bot.sendMessage(chatId, '✅ <b>Captura recibida.</b>\nEspera la confirmación del admin.', { parse_mode: 'HTML' });
-    await clearUserState(chatId);
+      const { data: req } = await supabase
+        .from('membership_requests')
+        .select('*, user:users(*)')
+        .eq('id', state.data.requestId)
+        .single();
 
-    // Obtener datos de la solicitud
-    const { data: req } = await supabase
-      .from('membership_requests')
-      .select('*, user:users(*)')
-      .eq('id', state.data.requestId)
-      .single();
-
-    // Notificar a los admins con botones de pago
-    for (const adminId of adminIds) {
-      const keyboard = {
-        inline_keyboard: [
-          [
-            { text: '✅ Aceptar pago', callback_data: `pay_accept_${req.id}` },
-            { text: '❌ Rechazar pago', callback_data: `pay_reject_${req.id}` }
+      for (const adminId of adminIds) {
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: '✅ Aceptar pago', callback_data: `pay_accept_${req.id}` },
+              { text: '❌ Rechazar pago', callback_data: `pay_reject_${req.id}` }
+            ],
           ],
-        ],
-      };
-      await bot.sendPhoto(
-        adminId,
-        publicUrl,
-        {
-          caption: `📸 <b>Nuevo pago recibido</b>\n\n👤 Usuario: @${msg.from.username || telegramId}\n📞 Teléfono: ${req.phone_number || 'No especificado'}\n🆔 Solicitud #${req.id}\n⭐ Plan Premium`,
-          reply_markup: keyboard,
-          parse_mode: 'HTML'
-        }
-      );
+        };
+        await bot.sendPhoto(
+          adminId,
+          publicUrl,
+          {
+            caption: `📸 *Nuevo pago recibido*\n\n👤 Usuario: @${msg.from.username || telegramId}\n📞 Teléfono: ${req.phone_number || 'No especificado'}\n🆔 Solicitud #${req.id}\n⭐ Plan Premium`,
+            reply_markup: keyboard,
+            parse_mode: 'Markdown'
+          }
+        );
+      }
+      return;
     }
+
+    // Si no es para pago, y el usuario es premium, enviar la imagen a Kheel
+    const user = await getUser(telegramId);
+    if (!user || user.membership !== 'premium' || isAdmin(telegramId)) return;
+
+    const fileLink = await bot.getFileLink(photo.file_id);
+    const reply = await askKheel(user.id, 'Analiza esta imagen:', fileLink);
+    await bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
+
   } catch (error) {
     logger.error(`Error en foto: ${error.message}`);
-    await bot.sendMessage(chatId, '❌ Error al procesar la imagen. Intenta de nuevo.');
-  }
-});
-
-// ================== IA PARA PREMIUM ==================
-bot.on('message', async (msg) => {
-  if (!msg.text || msg.text.startsWith('/')) return;
-  const chatId = msg.chat.id;
-  const telegramId = msg.from.id;
-  const text = msg.text;
-
-  if (isAdmin(telegramId)) return; // los admins no usan IA aquí
-
-  try {
-    const user = await getUser(telegramId);
-    if (!user || !user.approved || user.membership !== 'premium') return;
-
-    // Verificar horario de trading (no responder durante sesiones)
-    const now = getCubaNow();
-    const hour = now.getHours();
-    const minute = now.getMinutes();
-    const isTradingTime = (hour === 10 && minute < 30) || (hour === 22 && minute < 30);
-    if (isTradingTime) {
-      return bot.sendMessage(chatId, '⏳ <b>Estamos en horario de trading.</b> Vuelve después de la sesión.', { parse_mode: 'HTML' });
-    }
-
-    const reply = await askIA(user.id, text);
-    await bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
-
-  } catch (error) {
-    logger.error(`Error en IA usuario: ${error.message}`);
-    await bot.sendMessage(chatId, '❌ Lo siento, ahora no puedo procesar tu consulta.');
+    await bot.sendMessage(chatId, '❌ Error al procesar la imagen.');
   }
 });
 
@@ -1142,7 +1162,7 @@ cron.schedule('*/1 * * * *', async () => {
       if (!error) {
         const { data: users } = await supabase.from('users').select('telegram_id').eq('approved', true);
         for (const u of users || []) {
-          try { await bot.sendMessage(u.telegram_id, '🟢 <b>Sesión de trading INICIADA</b>', { parse_mode: 'HTML' }); } catch (e) { }
+          try { await bot.sendMessage(u.telegram_id, '🟢 *Sesión de trading INICIADA*', { parse_mode: 'Markdown' }); } catch (e) { }
         }
       }
     }
@@ -1164,7 +1184,7 @@ cron.schedule('*/1 * * * *', async () => {
         .eq('id', sess.id);
       const { data: users } = await supabase.from('users').select('telegram_id').eq('approved', true);
       for (const u of users || []) {
-        try { await bot.sendMessage(u.telegram_id, '🔴 <b>Sesión de trading FINALIZADA</b>', { parse_mode: 'HTML' }); } catch (e) { }
+        try { await bot.sendMessage(u.telegram_id, '🔴 *Sesión de trading FINALIZADA*', { parse_mode: 'Markdown' }); } catch (e) { }
       }
     }
   }
@@ -1184,8 +1204,8 @@ cron.schedule('*/1 * * * *', async () => {
     try {
       await bot.sendMessage(
         user.telegram_id,
-        '⏰ <b>Tu membresía premium ha expirado.</b>\nAhora eres usuario básico. Renueva con /planes si lo deseas.',
-        { parse_mode: 'HTML' }
+        '⏰ *Tu membresía premium ha expirado.*\nAhora eres usuario básico. Renueva con /planes si lo deseas.',
+        { parse_mode: 'Markdown' }
       );
     } catch (e) { }
   }
@@ -1247,7 +1267,7 @@ app.post('/admin/process', checkAdmin, async (req, res) => {
           .from('membership_requests')
           .update({ status: 'approved' })
           .eq('id', request_id);
-        await bot.sendMessage(reqData.user.telegram_id, '✅ <b>¡Solicitud básica aprobada!</b>\nYa puedes recibir señales.', { parse_mode: 'HTML' });
+        await bot.sendMessage(reqData.user.telegram_id, '✅ *¡Solicitud básica aprobada!*\nYa puedes recibir señales.', { parse_mode: 'Markdown' });
       } else {
         const premiumUntil = new Date();
         premiumUntil.setDate(premiumUntil.getDate() + 30);
@@ -1259,9 +1279,8 @@ app.post('/admin/process', checkAdmin, async (req, res) => {
           .from('membership_requests')
           .update({ status: 'approved' })
           .eq('id', request_id);
-        await bot.sendMessage(reqData.user.telegram_id, '✅ <b>¡Pago confirmado!</b>\nAhora eres usuario PREMIUM por 30 días.', { parse_mode: 'HTML' });
-        // Enviar mensaje de bienvenida premium
-        await sendPremiumWelcome(reqData.user.telegram_id);
+        await bot.sendMessage(reqData.user.telegram_id, '✅ *¡Pago confirmado!*\nAhora eres usuario PREMIUM por 30 días.', { parse_mode: 'Markdown' });
+        await sendPremiumWelcome(reqData.user.telegram_id, reqData.user_id);
       }
     } else if (action === 'reject') {
       if (!reason) return res.status(400).send('Debe proporcionar un motivo');
@@ -1269,7 +1288,7 @@ app.post('/admin/process', checkAdmin, async (req, res) => {
         .from('membership_requests')
         .update({ status: 'rejected', rejection_reason: reason })
         .eq('id', request_id);
-      await bot.sendMessage(reqData.user.telegram_id, `❌ <b>Tu solicitud ha sido rechazada.</b>\nMotivo: ${reason}`, { parse_mode: 'HTML' });
+      await bot.sendMessage(reqData.user.telegram_id, `❌ *Tu solicitud ha sido rechazada.*\nMotivo: ${reason}`, { parse_mode: 'Markdown' });
     }
 
     res.redirect(`/admin?telegram_id=${req.adminId}`);
