@@ -238,6 +238,21 @@ Si el usuario comparte una noticia, analiza su posible impacto en el mercado.`
   }
 }
 
+// ================== MENSAJE DE BIENVENIDA PREMIUM ==================
+async function sendPremiumWelcome(chatId) {
+  const welcomeMessage = 
+    '🎉 <b>¡Bienvenido a la membresía PREMIUM!</b>\n\n'
+    + 'Ahora tienes acceso a todas las funcionalidades exclusivas:\n\n'
+    + '📈 <b>Señales completas:</b> Recibirás hasta 10 señales por sesión (en lugar de 5).\n'
+    + '📊 <b>Estadísticas globales:</b> Puedes ver el historial completo de todas las señales desde el inicio del bot.\n'
+    + '🤖 <b>Asistente IA:</b> Puedes hacerme preguntas sobre trading, análisis técnico, gestión de riesgo, psicología, estrategias, etc. Simplemente escríbeme cualquier mensaje y te responderé (fuera de los horarios de trading).\n'
+    + '🔍 <b>Búsqueda de señales:</b> Usa el botón "🔍 Buscar señal" en el menú y escribe el ID de una señal para ver sus detalles.\n'
+    + '📚 <b>Contenido exclusivo:</b> Pronto añadiremos material educativo y estrategias probadas.\n\n'
+    + 'Para comenzar, explora el menú o simplemente hazme una pregunta sobre trading. ¡Disfruta de la experiencia premium!';
+  
+  await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML' });
+}
+
 // ================== COMANDO /START ==================
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
@@ -707,7 +722,7 @@ bot.on('callback_query', async (callbackQuery) => {
       await bot.editMessageText('✏️ <b>Envía el motivo del rechazo:</b>', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
     }
 
-    // ===== ADMIN: PAGOS =====
+    // ===== ADMIN: PAGOS (desde foto) =====
     else if (data.startsWith('pay_accept_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[2]);
       const { data: req } = await supabase
@@ -716,6 +731,11 @@ bot.on('callback_query', async (callbackQuery) => {
         .eq('id', reqId)
         .single();
       if (!req) return;
+
+      // Quitar los botones del mensaje de la foto (para que no se pueda volver a hacer clic)
+      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId });
+
+      // Actualizar usuario a premium
       const premiumUntil = new Date();
       premiumUntil.setDate(premiumUntil.getDate() + 30);
       await supabase
@@ -726,13 +746,20 @@ bot.on('callback_query', async (callbackQuery) => {
         .from('membership_requests')
         .update({ status: 'approved' })
         .eq('id', reqId);
-      await bot.editMessageText(`✅ Pago aceptado. Usuario premium hasta ${premiumUntil.toLocaleDateString()}.`, { chat_id: chatId, message_id: messageId });
-      await bot.sendMessage(req.user.telegram_id, '✅ <b>¡Pago confirmado!</b>\nAhora eres usuario PREMIUM por 30 días. Disfruta de todas las señales y la IA.', { parse_mode: 'HTML' });
+
+      // Confirmar al admin
+      await bot.sendMessage(chatId, `✅ Pago aceptado. Usuario premium hasta ${premiumUntil.toLocaleDateString()}.`);
+
+      // Enviar mensaje de bienvenida premium al usuario
+      await sendPremiumWelcome(req.user.telegram_id);
     }
     else if (data.startsWith('pay_reject_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[2]);
+      // Quitar los botones del mensaje de la foto
+      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId });
+      // Establecer estado para pedir motivo
       await setUserState(chatId, 'reject_reason', { reqId });
-      await bot.editMessageText('✏️ <b>Envía el motivo del rechazo del pago:</b>', { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+      await bot.sendMessage(chatId, '✏️ <b>Envía el motivo del rechazo del pago:</b>', { parse_mode: 'HTML' });
     }
 
     // ===== ADMIN: GESTIÓN DE SESIONES Y SEÑALES =====
@@ -1233,6 +1260,8 @@ app.post('/admin/process', checkAdmin, async (req, res) => {
           .update({ status: 'approved' })
           .eq('id', request_id);
         await bot.sendMessage(reqData.user.telegram_id, '✅ <b>¡Pago confirmado!</b>\nAhora eres usuario PREMIUM por 30 días.', { parse_mode: 'HTML' });
+        // Enviar mensaje de bienvenida premium
+        await sendPremiumWelcome(reqData.user.telegram_id);
       }
     } else if (action === 'reject') {
       if (!reason) return res.status(400).send('Debe proporcionar un motivo');
