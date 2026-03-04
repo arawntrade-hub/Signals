@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Panel de Administración | Trading Bot</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    body {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 2rem 1rem;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(10px);
+      border-radius: 20px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      overflow: hidden;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 1.5rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+
+    .header h1 {
+      font-size: 1.8rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .header h1::before {
+      content: "📊";
+      font-size: 2rem;
+    }
+
+    .admin-badge {
+      background: rgba(255, 255, 255, 0.2);
+      padding: 0.5rem 1rem;
+      border-radius: 50px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      backdrop-filter: blur(5px);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+    }
+
+    .refresh-btn {
+      background: white;
+      color: #667eea;
+      border: none;
+      padding: 0.6rem 1.2rem;
+      border-radius: 50px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s;
+      box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+    }
+
+    .refresh-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 15px rgba(0, 0, 0, 0.15);
+    }
+
+    .content {
+      padding: 2rem;
+    }
+
+    .section-title {
+      font-size: 1.4rem;
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .section-title::after {
+      content: '';
+      flex: 1;
+      height: 2px;
+      background: linear-gradient(90deg, #667eea, transparent);
+    }
+
+    .table-responsive {
+      overflow-x: auto;
+      border-radius: 12px;
+      box-shadow: 0 5px 15px rgba(0, 0, 0, 0.05);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: white;
+      font-size: 0.95rem;
+    }
+
+    th {
+      background: #f8fafd;
+      color: #2d3748;
+      font-weight: 600;
+      padding: 1rem 1.2rem;
+      text-align: left;
+      border-bottom: 2px solid #e2e8f0;
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 1rem 1.2rem;
+      border-bottom: 1px solid #e2e8f0;
+      color: #4a5568;
+    }
+
+    tr:hover td {
+      background: #f7fafc;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 0.3rem 0.8rem;
+      border-radius: 50px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: capitalize;
+    }
+
+    .badge-free {
+      background: #e6fffa;
+      color: #2c7a7b;
+    }
+
+    .badge-premium {
+      background: #fef3c7;
+      color: #975a16;
+    }
+
+    .badge-pending {
+      background: #fed7d7;
+      color: #9b2c2c;
+    }
+
+    .phone {
+      font-family: monospace;
+      background: #edf2f7;
+      padding: 0.2rem 0.5rem;
+      border-radius: 6px;
+      font-size: 0.9rem;
+    }
+
+    .payment-img {
+      max-width: 120px;
+      max-height: 80px;
+      border-radius: 8px;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+      transition: transform 0.2s;
+      cursor: pointer;
+    }
+
+    .payment-img:hover {
+      transform: scale(1.5);
+      box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+      z-index: 10;
+      position: relative;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .btn {
+      border: none;
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      font-weight: 500;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      text-decoration: none;
+    }
+
+    .btn-approve {
+      background: #48bb78;
+      color: white;
+    }
+
+    .btn-approve:hover {
+      background: #38a169;
+      transform: translateY(-1px);
+    }
+
+    .btn-reject {
+      background: #f56565;
+      color: white;
+    }
+
+    .btn-reject:hover {
+      background: #e53e3e;
+      transform: translateY(-1px);
+    }
+
+    .reject-form {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .reject-form input[type="text"] {
+      padding: 0.5rem 0.8rem;
+      border: 1px solid #cbd5e0;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      width: 150px;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 3rem;
+      background: #f9f9f9;
+      border-radius: 12px;
+      color: #718096;
+      font-size: 1.1rem;
+    }
+
+    .empty-state::before {
+      content: "📭";
+      display: block;
+      font-size: 3rem;
+      margin-bottom: 1rem;
+      opacity: 0.5;
+    }
+
+    @media (max-width: 768px) {
+      .header {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .actions {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .reject-form {
+        flex-direction: column;
+      }
+      .reject-form input[type="text"] {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Panel de Administración</h1>
+      <div>
+        <span class="admin-badge">🆔 Admin ID: <%= adminId %></span>
+        <a href="/admin?telegram_id=<%= adminId %>" class="refresh-btn">↻ Actualizar</a>
+      </div>
+    </div>
+
+    <div class="content">
+      <div class="section-title">📋 Solicitudes Pendientes</div>
+
+      <% if (requests.length === 0) { %>
+        <div class="empty-state">
+          No hay solicitudes pendientes en este momento
+        </div>
+      <% } else { %>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Usuario</th>
+                <th>Tipo</th>
+                <th>ID Quotex</th>
+                <th>Teléfono</th>
+                <th>Captura de Pago</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody>
+              <% requests.forEach(req => { %>
+                <tr>
+                  <td><strong>#<%= req.id %></strong></td>
+                  <td>
+                    <%= req.user.username ? '@' + req.user.username : req.user.telegram_id %><br>
+                    <small style="color:#718096;"><%= req.user.telegram_id %></small>
+                  </td>
+                  <td>
+                    <span class="badge <%= req.type === 'free' ? 'badge-free' : 'badge-premium' %>">
+                      <%= req.type === 'free' ? '🆓 Básico' : '⭐ Premium' %>
+                    </span>
+                  </td>
+                  <td>
+                    <% if (req.user.quotex_id) { %>
+                      <code><%= req.user.quotex_id %></code>
+                    <% } else { %>
+                      <span style="color:#a0aec0;">—</span>
+                    <% } %>
+                  </td>
+                  <td>
+                    <% if (req.phone_number) { %>
+                      <span class="phone"><%= req.phone_number %></span>
+                    <% } else { %>
+                      <span style="color:#a0aec0;">—</span>
+                    <% } %>
+                  </td>
+                  <td>
+                    <% if (req.payment_screenshot_file_id) { %>
+                      <a href="<%= req.payment_screenshot_file_id %>" target="_blank">
+                        <img src="<%= req.payment_screenshot_file_id %>" alt="captura" class="payment-img">
+                      </a>
+                    <% } else { %>
+                      <span style="color:#a0aec0;">—</span>
+                    <% } %>
+                  </td>
+                  <td>
+                    <div class="actions">
+                      <!-- Formulario de aprobación directa (si ya pagó) -->
+                      <form method="POST" action="/admin/process?telegram_id=<%= adminId %>" style="display:inline;">
+                        <input type="hidden" name="request_id" value="<%= req.id %>">
+                        <input type="hidden" name="action" value="approve">
+                        <button type="submit" class="btn btn-approve">✅ Aprobar</button>
+                      </form>
+
+                      <!-- Formulario de rechazo con motivo -->
+                      <form method="POST" action="/admin/process?telegram_id=<%= adminId %>" class="reject-form">
+                        <input type="hidden" name="request_id" value="<%= req.id %>">
+                        <input type="hidden" name="action" value="reject">
+                        <input type="text" name="reason" placeholder="Motivo del rechazo" required>
+                        <button type="submit" class="btn btn-reject">❌ Rechazar</button>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              <% }) %>
+            </tbody>
+          </table>
+        </div>
+      <% } %>
+    </div>
+  </div>
+</body>
+</html>
