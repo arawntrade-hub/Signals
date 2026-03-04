@@ -16,7 +16,7 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const openRouterKey = process.env.OPENROUTER_API_KEY;
 const cubaTz = process.env.CUBA_TZ || 'America/Havana';
-const BASE_URL = process.env.BASE_URL || 'http://localhost:' + (process.env.PORT || 3000);
+const BASE_URL = process.env.BASE_URL || 'https://signals-vtg7.onrender.com:' + (process.env.PORT || 3000);
 const PORT = process.env.PORT || 3000;
 
 // Configuración de logs
