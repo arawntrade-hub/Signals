@@ -21,6 +21,7 @@ const BASE_URL = process.env.BASE_URL || 'http://localhost:' + (process.env.PORT
 const PORT = process.env.PORT || 3000;
 const SITE_URL = process.env.SITE_URL || BASE_URL;
 const SITE_NAME = process.env.SITE_NAME || 'Trading Signals Bot';
+const REQUIRED_GROUP = process.env.REQUIRED_GROUP; // Ej: @migrupo
 
 // Configuración de logs
 const logger = winston.createLogger({
@@ -108,47 +109,147 @@ function isValidQuotexId(id) {
   return /^[a-zA-Z0-9]{6,20}$/.test(id);
 }
 
-// ================== MENÚ PRINCIPAL ==================
-const mainMenuKeyboard = {
-  reply_markup: {
-    keyboard: [
-      [{ text: '📊 Planes' }, { text: '📈 Estadísticas' }],
-      [{ text: '📜 Historial' }, { text: '❓ Ayuda' }],
-      [{ text: '🔍 Buscar señal' }]  // Kheel IA se añade dinámicamente si es premium
-    ],
-    resize_keyboard: true,
-    one_time_keyboard: false
-  }
-};
+// ================== VERIFICACIÓN DE GRUPO ==================
+const groupCheckCache = new Map(); // chatId -> { timestamp, result }
 
-const adminMenuKeyboard = {
-  reply_markup: {
-    keyboard: [
-      [{ text: '📊 Planes' }, { text: '📈 Estadísticas' }],
-      [{ text: '📜 Historial' }, { text: '❓ Ayuda' }],
-      [{ text: '🔧 Panel Admin' }, { text: '🔍 Buscar señal' }]
-    ],
-    resize_keyboard: true
+async function checkGroupMembership(telegramId) {
+  if (!REQUIRED_GROUP) return true; // Si no hay grupo configurado, se salta
+  const cacheKey = `group_${telegramId}`;
+  const cached = groupCheckCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp) < 3600000) { // 1 hora de caché
+    return cached.result;
   }
-};
+  try {
+    // Intentar obtener información del miembro en el grupo
+    let chatId = REQUIRED_GROUP;
+    const member = await bot.getChatMember(chatId, telegramId);
+    const isMember = ['member', 'administrator', 'creator'].includes(member.status);
+    groupCheckCache.set(cacheKey, { timestamp: Date.now(), result: isMember });
+    return isMember;
+  } catch (err) {
+    logger.error(`Error verificando membresía de grupo para ${telegramId}: ${err.message}`);
+    return false;
+  }
+}
 
-// Función para actualizar el menú según membresía
-async function updateMenu(chatId, telegramId) {
-  const user = await getUser(telegramId);
-  if (!user) return;
-  let keyboard;
-  if (isAdmin(telegramId)) {
-    keyboard = { ...adminMenuKeyboard };
-    if (user.membership === 'premium') {
-      keyboard.reply_markup.keyboard.push([{ text: '🤖 Kheel IA' }]);
+// Middleware para verificar grupo antes de procesar mensajes (excepto /start)
+async function ensureGroupMembership(telegramId, chatId) {
+  const isMember = await checkGroupMembership(telegramId);
+  if (!isMember) {
+    await bot.sendMessage(chatId, 
+      `⚠️ Para usar este bot, debes unirte a nuestro grupo obligatorio: ${REQUIRED_GROUP}\n` +
+      `Luego de unirte, intenta nuevamente.`, 
+      { parse_mode: 'Markdown' }
+    );
+    return false;
+  }
+  return true;
+}
+
+// ================== SISTEMA DE REFERIDOS ==================
+async function createReferral(referrerId, referredUserId) {
+  const { error } = await supabase
+    .from('referrals')
+    .insert([{
+      referrer_user_id: referrerId,
+      referred_user_id: referredUserId,
+      status: 'pending'
+    }]);
+  if (error) logger.error(`Error creando referido: ${error.message}`);
+}
+
+async function completeReferral(referredUserId) {
+  // Buscar si hay un referido pendiente para este usuario
+  const { data: referral, error } = await supabase
+    .from('referrals')
+    .select('*')
+    .eq('referred_user_id', referredUserId)
+    .eq('status', 'pending')
+    .single();
+  if (error || !referral) return;
+
+  // Marcar como completado
+  await supabase
+    .from('referrals')
+    .update({ status: 'completed' })
+    .eq('id', referral.id);
+
+  // Contar referidos completados del referrer
+  const { count, error: countError } = await supabase
+    .from('referrals')
+    .select('*', { count: 'exact', head: true })
+    .eq('referrer_user_id', referral.referrer_user_id)
+    .eq('status', 'completed');
+
+  if (countError) {
+    logger.error(`Error contando referidos: ${countError.message}`);
+    return;
+  }
+
+  // Si llegó a 10, otorgar premium gratis
+  if (count >= 10) {
+    const premiumUntil = new Date();
+    premiumUntil.setDate(premiumUntil.getDate() + 30);
+    await supabase
+      .from('users')
+      .update({ membership: 'premium', premium_until: premiumUntil.toISOString(), approved: true })
+      .eq('id', referral.referrer_user_id);
+    
+    // Notificar al referrer
+    const { data: referrer } = await supabase
+      .from('users')
+      .select('telegram_id')
+      .eq('id', referral.referrer_user_id)
+      .single();
+    if (referrer) {
+      await bot.sendMessage(referrer.telegram_id, 
+        '🎉 *¡Felicidades!* Has alcanzado 10 referidos completados.\n' +
+        'Como recompensa, te hemos otorgado *1 mes de membresía premium gratis*. 🚀\n' +
+        'Disfruta de todos los beneficios.',
+        { parse_mode: 'Markdown' }
+      );
     }
+  }
+}
+
+// ================== MENÚ PRINCIPAL (NUEVO ESTILO) ==================
+function getMainMenuKeyboard(isPremium, isAdminUser) {
+  const keyboard = [];
+  
+  // Fila 1: Planes y Estadísticas
+  keyboard.push([{ text: '💼 Planes' }, { text: '📊 Estadísticas' }]);
+  
+  // Fila 2: Historial y Ayuda
+  keyboard.push([{ text: '📋 Historial' }, { text: '❓ Ayuda' }]);
+  
+  // Fila 3: Buscar señal (si premium) y Kheel IA (si premium)
+  const row3 = [];
+  if (isPremium) {
+    row3.push({ text: '🔎 Buscar señal' });
+    row3.push({ text: '🧠 Kheel IA' });
   } else {
-    keyboard = { ...mainMenuKeyboard };
-    if (user.membership === 'premium') {
-      keyboard.reply_markup.keyboard.push([{ text: '🤖 Kheel IA' }]);
-    }
+    // Si no es premium, mostrar solo Buscar señal pero deshabilitado? Mejor no mostrarlo.
+    // O podemos poner un placeholder? No, mejor no mostrar.
   }
-  await bot.sendMessage(chatId, 'Menú actualizado:', keyboard);
+  if (row3.length > 0) {
+    keyboard.push(row3);
+  }
+  
+  // Fila 4: Perfil y Referidos (para todos)
+  keyboard.push([{ text: '👤 Mi perfil' }, { text: '🔗 Referidos' }]);
+  
+  // Fila 5: Panel Admin (solo admin)
+  if (isAdminUser) {
+    keyboard.push([{ text: '⚙️ Panel Admin' }]);
+  }
+  
+  return {
+    reply_markup: {
+      keyboard: keyboard,
+      resize_keyboard: true,
+      one_time_keyboard: false
+    }
+  };
 }
 
 // ================== ESTADOS PERSISTENTES EN SUPABASE ==================
@@ -211,7 +312,7 @@ async function uploadPhotoToSupabase(fileId, userId) {
   }
 }
 
-// ================== IA KHEEL (MÚLTIPLES MODELOS) ==================
+// ================== IA KHEEL ==================
 function chooseModel(userMessage, hasImage = false) {
   if (hasImage) {
     return 'qwen/qwen3-vl-30b-a3b-thinking';
@@ -243,24 +344,25 @@ async function askKheel(userId, userMessage, imageUrl = null) {
 
   messages.push({
     role: 'system',
-    content: `Eres Kheel, un asistente experto en trading de opciones binarias. 
-Tu personalidad es amigable, educativa y motivadora. 
-Hablas en español y usas emojis para hacer la conversación más amena.
+    content: `Eres Kheel, un asistente experto en trading de opciones binarias, pero con una personalidad súper amigable, cálida y humana. 🧑‍🏫💬
+
+Hablas en español de forma natural, como si fueras un amigo que sabe mucho de trading. Usas muchos emojis 😊👍🔥 para hacer la conversación divertida y cercana. Evitas el formato markdown excesivo (como ###, listas numeradas con números y puntos, etc.). En su lugar, usas texto plano con algún que otro asterisco para *enfatizar* si hace falta, pero siempre de forma sencilla.
 
 Tus funciones incluyen:
-- Enseñar análisis técnico y fundamental.
+- Enseñar análisis técnico y fundamental de manera fácil de entender.
 - Ayudar con gestión de riesgo y psicología del trading.
-- Crear estrategias personalizadas según el nivel del usuario.
-- Recomendar recursos (videos, documentos, libros).
-- Analizar noticias que el usuario comparta.
-- Jugar juegos educativos (trivial, preguntas) si el usuario lo desea.
+- Crear estrategias personalizadas según el nivel del usuario (principiante, intermedio, avanzado).
+- Recomendar recursos: videos, documentos, libros (puedes sugerir títulos o canales de YouTube).
+- Analizar noticias que el usuario comparta (si te pasa una noticia por texto, comenta su posible impacto).
+- Si el usuario envía una imagen, mírala y comenta lo que veas. Si es un gráfico, analízalo; si es una imagen divertida o de otro tema, haz un comentario simpático y luego vuelve al tema de trading.
+- Jugar juegos educativos: trivial, preguntas, ejercicios interactivos.
 - Responder preguntas sobre el mercado y opciones binarias.
 
-Siempre debes tratar de conocer el nivel del usuario (principiante, intermedio, avanzado) para adaptar tus respuestas.
-Si el usuario no especifica, puedes preguntarle.
-Puedes sugerir un plan de estudio o ejercicios prácticos.
-Nunca des consejos de inversión personalizados ni prometas resultados.
-Si el usuario envía una imagen (gráfico, noticia), analízala y comenta lo que veas relevante.`
+Siempre intenta conocer el nivel del usuario para adaptar tus respuestas. Si no lo sabes, pregúntale de forma natural. Puedes sugerir un plan de estudio o ejercicios prácticos.
+
+Nunca des consejos de inversión personalizados ni prometas resultados. Recuerda que el trading tiene riesgos y debes ser responsable.
+
+¡Sé creativo, divertido y cercano! El objetivo es que el usuario se sienta cómodo y motivado para aprender. 🚀`
   });
 
   if (history && history.length > 0) {
@@ -313,7 +415,7 @@ Si el usuario envía una imagen (gráfico, noticia), analízala y comenta lo que
 
 async function startKheelConversation(chatId, userId) {
   const welcomeMessage = 
-    '🤖 *¡Hola! Soy Kheel, tu asistente personal de trading.*\n\n'
+    '🧠 *¡Hola! Soy Kheel, tu asistente personal de trading.*\n\n'
     + 'Estoy aquí para ayudarte a mejorar tus conocimientos y habilidades en opciones binarias.\n\n'
     + 'Para empezar, cuéntame:\n\n'
     + '1️⃣ ¿Cuál es tu nivel de experiencia? (Principiante, Intermedio, Avanzado)\n'
@@ -330,24 +432,102 @@ async function sendPremiumWelcome(chatId, userId) {
     + 'Ahora tienes acceso a:\n'
     + '📈 *10 señales por sesión* (en lugar de 5).\n'
     + '📊 *Estadísticas globales* desde el inicio del bot.\n'
-    + '🤖 *Kheel IA* - Tu asistente inteligente para aprender y resolver dudas.\n'
-    + '🔍 *Búsqueda de señales* por ID.\n\n'
-    + 'Para comenzar, presiona el botón *🤖 Kheel IA* en el menú y conversa conmigo.\n\n'
+    + '🧠 *Kheel IA* - Tu asistente inteligente para aprender y resolver dudas.\n'
+    + '🔎 *Búsqueda de señales* por ID.\n\n'
+    + 'Para comenzar, presiona el botón *🧠 Kheel IA* en el menú y conversa conmigo.\n\n'
     + '¡Disfruta de la experiencia premium! 🚀';
   
   await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
   await startKheelConversation(chatId, userId);
 }
 
+// ================== FUNCIONES DE PERFIL Y REFERIDOS ==================
+async function showProfile(chatId, user) {
+  const membership = user.membership === 'premium' ? '⭐ Premium' : '🆓 Básico';
+  let daysLeft = '';
+  if (user.membership === 'premium' && user.premium_until) {
+    const until = new Date(user.premium_until);
+    const now = new Date();
+    const diff = Math.ceil((until - now) / (1000 * 60 * 60 * 24));
+    daysLeft = `\n📅 *Días restantes:* ${diff}`;
+  }
+  
+  // Contar referidos completados
+  const { count, error } = await supabase
+    .from('referrals')
+    .select('*', { count: 'exact', head: true })
+    .eq('referrer_user_id', user.id)
+    .eq('status', 'completed');
+  
+  const referralsCount = error ? 0 : count;
+  
+  const message = 
+    `👤 *Mi perfil*\n\n` +
+    `🆔 ID: ${user.telegram_id}\n` +
+    `📋 Membresía: ${membership}${daysLeft}\n` +
+    `🔗 Referidos completados: ${referralsCount} / 10\n\n` +
+    `*¿Qué puedes hacer aquí?*\n` +
+    `• Ver tu progreso de referidos.\n` +
+    `• Consultar tu estado de membresía.\n` +
+    `• Si tienes 10 referidos, obtienes premium gratis.`;
+  
+  await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+}
+
+async function showReferrals(chatId, user) {
+  const referralLink = `https://t.me/${bot.options.username}?start=${user.telegram_id}`;
+  
+  const { count, error } = await supabase
+    .from('referrals')
+    .select('*', { count: 'exact', head: true })
+    .eq('referrer_user_id', user.id)
+    .eq('status', 'completed');
+  
+  const completed = error ? 0 : count;
+  
+  const message = 
+    `🔗 *Tus referidos*\n\n` +
+    `Comparte este enlace con tus amigos:\n` +
+    `\`${referralLink}\`\n\n` +
+    `📊 *Progreso:* ${completed} / 10 referidos completados\n\n` +
+    `🎁 *Recompensa:* Al llegar a 10, obtienes 1 mes de premium gratis.\n` +
+    `*¿Cómo funciona?* Cuando alguien se registra con tu enlace y completa el proceso (envía ID de Quotex y es aprobado), se cuenta como referido.`;
+  
+  await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+}
+
 // ================== COMANDO /START ==================
-bot.onText(/\/start/, async (msg) => {
+bot.onText(/\/start(?:\s+(\d+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const telegramId = msg.from.id;
   const username = msg.from.username;
+  const referrerId = match[1] ? parseInt(match[1]) : null;
 
   try {
     const user = await getOrCreateUser(telegramId, username);
-    await updateMenu(chatId, telegramId);
+
+    if (referrerId && referrerId !== telegramId) {
+      const referrer = await getUser(referrerId);
+      if (referrer) {
+        const { data: existing } = await supabase
+          .from('referrals')
+          .select('id')
+          .eq('referred_user_id', user.id)
+          .maybeSingle();
+        if (!existing) {
+          await createReferral(referrer.id, user.id);
+        }
+      }
+    }
+
+    if (!isAdmin(telegramId)) {
+      const ok = await ensureGroupMembership(telegramId, chatId);
+      if (!ok) return;
+    }
+
+    const isPremium = user.membership === 'premium';
+    const keyboard = getMainMenuKeyboard(isPremium, isAdmin(telegramId));
+    
     const welcomeText = 
       '🚀 *¡Bienvenido al Bot de Señales de Trading!*\n\n'
       + '📊 *¿Qué ofrecemos?*\n'
@@ -358,12 +538,9 @@ bot.onText(/\/start/, async (msg) => {
       + '🎯 *Planes:*\n'
       + '🆓 *Básico (gratis):* 5 señales por sesión, estadísticas desde tu registro.\n'
       + '⭐ *Premium (3000 CUP/mes):* 10 señales por sesión, estadísticas completas, acceso a Kheel IA, búsqueda de señales.\n\n'
-      + 'Para contratar, usa el botón *📊 Planes* del menú.';
-    await bot.sendMessage(
-      chatId,
-      welcomeText,
-      { parse_mode: 'Markdown' }
-    );
+      + 'Para contratar, usa el botón *💼 Planes* del menú.';
+    
+    await bot.sendMessage(chatId, welcomeText, { ...keyboard, parse_mode: 'Markdown' });
   } catch (error) {
     logger.error(`Error en /start: ${error.message}`);
     await bot.sendMessage(chatId, '❌ Ocurrió un error. Intenta más tarde.');
@@ -386,6 +563,11 @@ bot.on('message', async (msg) => {
   const username = msg.from.username;
 
   try {
+    if (!isAdmin(telegramId) && !text.startsWith('/start')) {
+      const ok = await ensureGroupMembership(telegramId, chatId);
+      if (!ok) return;
+    }
+
     const state = await getUserState(chatId);
     logger.info(`Mensaje de ${telegramId}: "${text}" - Estado: ${JSON.stringify(state)}`);
 
@@ -412,8 +594,8 @@ bot.on('message', async (msg) => {
     const user = await getUser(telegramId);
     if (!user) return bot.sendMessage(chatId, '❌ Usa /start primero.');
 
-    if (text === '📊 Planes') {
-      // Verificar si ya es premium vigente
+    // Procesar opciones del menú
+    if (text === '💼 Planes') {
       if (user.membership === 'premium' && user.premium_until && new Date(user.premium_until) > new Date()) {
         return bot.sendMessage(chatId, '⚠️ Ya eres usuario premium. No puedes solicitar otro plan hasta que expire tu membresía actual.', { parse_mode: 'Markdown' });
       }
@@ -425,39 +607,47 @@ bot.on('message', async (msg) => {
       };
       await bot.sendMessage(chatId, '📋 *Elige un plan:*', { reply_markup: keyboard, parse_mode: 'Markdown' });
     }
-    else if (text === '📈 Estadísticas') {
+    else if (text === '📊 Estadísticas') {
       await handleEstadisticas(chatId, user);
     }
-    else if (text === '📜 Historial') {
+    else if (text === '📋 Historial') {
       await handleHistorial(chatId, user);
     }
-    else if (text === '🔍 Buscar señal') {
+    else if (text === '🔎 Buscar señal') {
       if (user.membership !== 'premium') {
         return bot.sendMessage(chatId, '❌ Esta función es solo para usuarios premium.');
       }
       await setUserState(chatId, 'search_signal', {});
       await bot.sendMessage(chatId, '🔍 *Ingresa el ID de la señal que deseas buscar:*', { parse_mode: 'Markdown' });
     }
-    else if (text === '🤖 Kheel IA') {
+    else if (text === '🧠 Kheel IA') {
       if (user.membership !== 'premium') {
         return bot.sendMessage(chatId, '❌ El asistente Kheel es solo para usuarios premium.');
       }
       await startKheelConversation(chatId, user.id);
     }
+    else if (text === '👤 Mi perfil') {
+      await showProfile(chatId, user);
+    }
+    else if (text === '🔗 Referidos') {
+      await showReferrals(chatId, user);
+    }
     else if (text === '❓ Ayuda') {
       await bot.sendMessage(chatId, 
         '❓ *Ayuda*\n\n'
-        + '📊 Planes: Ver y contratar membresías.\n'
-        + '📈 Estadísticas: Rendimiento según tu plan.\n'
-        + '📜 Historial: Últimas señales recibidas.\n'
-        + '🔍 Buscar señal: Premium - consulta detalles de una señal por ID.\n'
-        + '🤖 Kheel IA: Premium - asistente inteligente para aprender.\n'
-        + '🔧 Panel Admin: Solo para administradores.\n\n'
+        + '💼 Planes: Ver y contratar membresías.\n'
+        + '📊 Estadísticas: Rendimiento según tu plan.\n'
+        + '📋 Historial: Últimas señales recibidas.\n'
+        + '🔎 Buscar señal: Premium - consulta detalles de una señal por ID.\n'
+        + '🧠 Kheel IA: Premium - asistente inteligente para aprender.\n'
+        + '👤 Mi perfil: Ver tu estado y referidos.\n'
+        + '🔗 Referidos: Obtener enlace y progreso.\n'
+        + '⚙️ Panel Admin: Solo para administradores.\n\n'
         + 'Para cancelar una acción en curso, usa /cancelar.',
         { parse_mode: 'Markdown' }
       );
     }
-    else if (text === '🔧 Panel Admin' && isAdmin(telegramId)) {
+    else if (text === '⚙️ Panel Admin' && isAdmin(telegramId)) {
       const keyboard = {
         inline_keyboard: [
           [{ text: '🟢 Abrir sesión manual', callback_data: 'admin_open_session' }],
@@ -471,7 +661,7 @@ bot.on('message', async (msg) => {
       await bot.sendMessage(chatId, '🔧 *Panel de Administración:*', { reply_markup: keyboard, parse_mode: 'Markdown' });
     }
     else if (user.membership === 'premium') {
-      // Cualquier otro texto lo responde Kheel (incluyendo admins premium)
+      await bot.sendChatAction(chatId, 'typing');
       try {
         const reply = await askKheel(user.id, text);
         await bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
@@ -747,14 +937,12 @@ bot.on('callback_query', async (callbackQuery) => {
     const user = await getOrCreateUser(telegramId, username);
     logger.info(`Callback: data=${data}, chatId=${chatId}, telegramId=${telegramId}`);
 
-    // ===== CANCELAR =====
     if (data === 'cancel_request') {
       await clearUserState(chatId);
       await bot.editMessageText('✅ Solicitud cancelada.', { chat_id: chatId, message_id: messageId });
       return;
     }
 
-    // ===== PLANES =====
     if (data === 'plan_free') {
       if (user.membership === 'premium' && user.premium_until && new Date(user.premium_until) > new Date()) {
         return bot.editMessageText('⚠️ Ya eres usuario premium. No puedes solicitar otro plan.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
@@ -808,8 +996,6 @@ bot.on('callback_query', async (callbackQuery) => {
         { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: keyboard }
       );
     }
-
-    // ===== ADMIN: APROBAR/RECHAZAR (solo free) =====
     else if (data.startsWith('approve_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[1]);
       const { data: req, error } = await supabase
@@ -831,6 +1017,7 @@ bot.on('callback_query', async (callbackQuery) => {
           .eq('id', reqId);
         await bot.editMessageText(`✅ Solicitud #${reqId} aprobada (gratis).`, { chat_id: chatId, message_id: messageId });
         await bot.sendMessage(req.user.telegram_id, '✅ *¡Felicidades!* Tu solicitud básica ha sido aprobada. Ya puedes recibir señales.', { parse_mode: 'Markdown' });
+        await completeReferral(req.user_id);
       } else {
         await bot.editMessageText('⚠️ Para aprobar un premium, usa el botón de pago.', { chat_id: chatId, message_id: messageId });
       }
@@ -845,8 +1032,6 @@ bot.on('callback_query', async (callbackQuery) => {
         { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: keyboard }
       );
     }
-
-    // ===== ADMIN: PAGOS =====
     else if (data.startsWith('pay_accept_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[2]);
       const { data: req } = await supabase
@@ -871,6 +1056,7 @@ bot.on('callback_query', async (callbackQuery) => {
 
       await bot.sendMessage(chatId, `✅ Pago aceptado. Usuario premium hasta ${premiumUntil.toLocaleDateString()}.`);
       await sendPremiumWelcome(req.user.telegram_id, req.user_id);
+      await completeReferral(req.user_id);
     }
     else if (data.startsWith('pay_reject_') && isAdmin(telegramId)) {
       const reqId = parseInt(data.split('_')[2]);
@@ -880,8 +1066,6 @@ bot.on('callback_query', async (callbackQuery) => {
       const keyboard = { inline_keyboard: [cancelButton] };
       await bot.sendMessage(chatId, '✏️ *Envía el motivo del rechazo del pago:*', { parse_mode: 'Markdown', reply_markup: keyboard });
     }
-
-    // ===== ADMIN: GESTIÓN DE SESIONES Y SEÑALES =====
     else if (data === 'admin_open_session' && isAdmin(telegramId)) {
       const { data: openSession } = await supabase
         .from('sessions')
@@ -1143,7 +1327,11 @@ bot.on('photo', async (msg) => {
   const photo = msg.photo[msg.photo.length - 1];
 
   try {
-    // Primero, verificar si es para pago premium
+    if (!isAdmin(telegramId)) {
+      const ok = await ensureGroupMembership(telegramId, chatId);
+      if (!ok) return;
+    }
+
     const state = await getUserState(chatId);
     if (state && state.step === 'awaiting_screenshot') {
       const user = await getUser(telegramId);
@@ -1186,10 +1374,10 @@ bot.on('photo', async (msg) => {
       return;
     }
 
-    // Si no es para pago, y el usuario es premium, enviar la imagen a Kheel
     const user = await getUser(telegramId);
     if (!user || user.membership !== 'premium') return;
 
+    await bot.sendChatAction(chatId, 'typing');
     const fileLink = await bot.getFileLink(photo.file_id);
     const reply = await askKheel(user.id, 'Analiza esta imagen:', fileLink);
     await bot.sendMessage(chatId, reply, { parse_mode: 'Markdown' });
@@ -1205,7 +1393,6 @@ cron.schedule('*/1 * * * *', async () => {
   const now = getCubaNow();
   const hours = [10, 22];
 
-  // Apertura automática
   for (const hour of hours) {
     const targetTime = new Date(now);
     targetTime.setHours(hour, 0, 0, 0);
@@ -1240,7 +1427,6 @@ cron.schedule('*/1 * * * *', async () => {
     }
   }
 
-  // Cierre automático
   const { data: openSessions } = await supabase
     .from('sessions')
     .select('*')
@@ -1261,7 +1447,6 @@ cron.schedule('*/1 * * * *', async () => {
     }
   }
 
-  // Degradar premiums expirados
   const { data: expired } = await supabase
     .from('users')
     .select('id, telegram_id')
@@ -1340,6 +1525,7 @@ app.post('/admin/process', checkAdmin, async (req, res) => {
           .update({ status: 'approved' })
           .eq('id', request_id);
         await bot.sendMessage(reqData.user.telegram_id, '✅ *¡Solicitud básica aprobada!*\nYa puedes recibir señales.', { parse_mode: 'Markdown' });
+        await completeReferral(reqData.user_id);
       } else {
         const premiumUntil = new Date();
         premiumUntil.setDate(premiumUntil.getDate() + 30);
@@ -1353,6 +1539,7 @@ app.post('/admin/process', checkAdmin, async (req, res) => {
           .eq('id', request_id);
         await bot.sendMessage(reqData.user.telegram_id, '✅ *¡Pago confirmado!*\nAhora eres usuario PREMIUM por 30 días.', { parse_mode: 'Markdown' });
         await sendPremiumWelcome(reqData.user.telegram_id, reqData.user_id);
+        await completeReferral(reqData.user_id);
       }
     } else if (action === 'reject') {
       if (!reason) return res.status(400).send('Debe proporcionar un motivo');
@@ -1373,6 +1560,22 @@ app.post('/admin/process', checkAdmin, async (req, res) => {
 // Iniciar servidor web
 app.listen(PORT, () => {
   logger.info(`✅ Servidor web escuchando en puerto ${PORT}`);
+});
+
+// ================== KEEP ALIVE INTERNO ==================
+// Cada 5 minutos, hacer una petición a sí mismo para mantener el servicio activo en Render
+const keepAliveInterval = setInterval(async () => {
+  try {
+    await axios.get(`${BASE_URL}/health`);
+    logger.info('Keep alive ping realizado');
+  } catch (err) {
+    logger.error(`Error en keep alive: ${err.message}`);
+  }
+}, 5 * 60 * 1000); // 5 minutos
+
+// Endpoint de health
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
 });
 
 logger.info('✅ Bot iniciado correctamente');
